@@ -44,6 +44,14 @@ from models.tactic_predictor import (TrainablePredictor,
                                      optimize_checkpoints,
                                      save_checkpoints, tokenize_goals,
                                      embed_data, add_tokenizer_args)
+from dataloader import (features_polyarg_tensors,
+                        features_polyarg_tensors_with_meta,
+                        sample_fpa,
+                        decode_fpa_result,
+                        features_vocab_sizes,
+                        get_num_tokens,
+                        get_num_indices,
+                        DataloaderArgs)
 
 import threading
 import multiprocessing
@@ -80,6 +88,8 @@ class FeaturesPolyArgSample(NamedTuple):
 
 class FeaturesPolyArgDataset(ListDataset[FeaturesPolyArgSample]):
     pass
+
+FeaturesPolyargState = Tuple[Any, NeuralPredictorState]
 
 class GoalTokenArgModel(nn.Module):
     def __init__(self, stem_vocab_size : int,
@@ -213,13 +223,24 @@ class FeaturesPolyargPredictor(
         self.training_args : Optional[argparse.Namespace] = None
         self.training_loss : Optional[float] = None
         self.num_epochs : Optional[int] = None
-        self._word_feature_functions: Optional[List[WordFeature]] = None
-        self._vec_feature_functions: Optional[List[VecFeature]] = None
+        # self._word_feature_functions: Optional[List[WordFeature]] = None
+        # self._vec_feature_functions: Optional[List[VecFeature]] = None
         self._softmax = maybe_cuda(nn.LogSoftmax(dim=1))
         self._softmax2 = maybe_cuda(nn.LogSoftmax(dim=2))
-        self._tokenizer : Optional[Tokenizer] = None
-        self._embedding : Optional[Embedding] = None
+        # self._tokenizer : Optional[Tokenizer] = None
+        # self._embedding : Optional[Embedding] = None
         self._model : Optional[FeaturesPolyArgModel] = None
+
+    def train(self, args : List[str]) -> None:
+        argparser = argparse.ArgumentParser(self._description())
+        self.add_args_to_parser(argparser)
+        arg_values = argparser.parse_args(args)
+        save_states = self._optimize_model_to_disc(arg_values)
+
+        for stat in save_states:
+            with open(arg_values.save_file, 'wb') as f:
+                torch.save((self.shortname(), (arg_values, state)), f)
+
     def predictKTactics(self, context : TacticContext, k : int) -> List[Prediction]:
         assert self._tokenizer
         assert self._embedding
@@ -465,6 +486,8 @@ class FeaturesPolyargPredictor(
             feature_set = feature_set.union(new_args)
         parser.add_argument("--max-length", dest="max_length", type=int,
                             default=default_values.get("max-length", 30))
+        parser.add_argument("--max-string-distance", type=int,
+                            default=default_values.get("max-string-distance", 50))
         parser.add_argument("--max-beam-width", dest="max_beam_width", type=int,
                             default=default_values.get("max-beam-width", 10))
         parser.add_argument("--no-lemma-args", dest="lemma_args", action='store_false')
@@ -520,30 +543,72 @@ class FeaturesPolyargPredictor(
         assert self._vec_feature_functions
         return result_data, (tokenizer, embedding, self._word_feature_functions,
                              self._vec_feature_functions)
-    def _optimize_model_to_disc(self,
-                                encoded_data : FeaturesPolyArgDataset,
-                                metadata : Tuple[Tokenizer, Embedding,
-                                                 List[WordFeature], List[VecFeature]],
-                                arg_values : Namespace) \
-        -> None:
-        tokenizer, embedding, word_features, vec_features = metadata
-        save_checkpoints("polyarg",
-                         metadata, arg_values,
-                         self._optimize_checkpoints(encoded_data, arg_values,
-                                                    tokenizer, embedding))
-    def _optimize_checkpoints(self, encoded_data : FeaturesPolyArgDataset,
-                              arg_values : Namespace,
-                              tokenizer : Tokenizer,
-                              embedding : Embedding) \
-        -> Iterable[NeuralPredictorState]:
-        return optimize_checkpoints(self._data_tensors(encoded_data, arg_values),
-                                    arg_values,
-                                    self._get_model(arg_values, embedding.num_tokens(),
-                                                    tokenizer.numTokens()),
-                                    lambda batch_tensors, model:
-                                    self._getBatchPredictionLoss(arg_values,
-                                                                 batch_tensors,
-                                                                 model))
+    def _optimize_model_to_disc(self, arg_values : Namespace) -> Iterable[FeaturesPolyargState]:
+        with print_time("Loading data", guard=arg_values.verbose):
+            if arg_values.start_from:
+                _, (arg_values, (metadata, state)) = torch.load(arg_values.start_from)
+                _, data_lists, \
+                (word_features_size, vec_features_size) = \
+                    features_polyarg_tensors_with_meta(extract_dataloader_args(arg_values),
+                                                       str(arg_values.scrape_file),
+                                                       metadata)
+            else:
+                metadata, data_lists, \
+                (word_features_size, vec_features_size) = \
+                    features_polyarg_tensors(extract_dataloader_args(arg_values),
+                                             str(arg_values.scrape_file))
+        with print_time("Converting data to tensors", guard=arg_values.verbose):
+            unpadded_tokenized_hyp_types, \
+            unpadded_hyp_features, \
+            num_hyps, \
+            tokenized_goals, \
+            word_features, \
+            vec_features, \
+            tactic_stem_indices, \
+            arg_indices = data_lists
+
+            tensors = [pad_sequence([torch.LongTensor(tokenized_hyps_list)
+                                     for tokenized_hyps_list
+                                     in unpadded_tokenized_hyp_types]),
+                       pad_sequence([torch.FloatTensor(hyp_features_vec)
+                                     for hyp_features_vec
+                                     in unpadded_hyp_features]),
+                       torch.LongTensor(num_hyps),
+                       torch.LongTensor(tokenize_goals),
+                       torch.LongTensor(word_features),
+                       torch.FloatTensor(vec_features),
+                       torch.LongTensor(tactic_stem_indices),
+                       torch.LongTensor(arg_indices)]
+
+        with print_time("Building the model", guard=arg_values.verbose):
+            model = self._get_model(arg_values, get_num_tokens(metadata), get_num_indices(metadata))
+            if arg_values.start_from:
+                model.load_saved_state(arg_values, state)
+
+        return ((metadata, state) for state in optimize_checkpoints(tensors, arg_values, model,
+                                                                    lambda batch_tensors, model:
+                                                                    self._get_batch_prediction_loss(arg_values,
+                                                                                                    batch_tensors,
+                                                                                                    model)))
+
+        # tokenizer, embedding, word_features, vec_features = metadata
+        # save_checkpoints("polyarg",
+        #                  metadata, arg_values,
+        #                  self._optimize_checkpoints(encoded_data, arg_values,
+        #                                             tokenizer, embedding))
+    # def _optimize_checkpoints(self, encoded_data : FeaturesPolyArgDataset,
+    #                           arg_values : Namespace,
+    #                           tokenizer : Tokenizer,
+    #                           embedding : Embedding) \
+    #     -> Iterable[NeuralPredictorState]:
+    #     return optimize_checkpoints(self._data_tensors(encoded_data, arg_values),
+    #                                 arg_values,
+    #                                 self._get_model(arg_values, embedding.num_tokens(),
+    #                                                 tokenizer.numTokens()),
+    #                                 lambda batch_tensors, model:
+    #                                 self._getBatchPredictionLoss(arg_values,
+    #                                                              batch_tensors,
+    #                                                              model))
     def load_saved_state(self,
                          args : Namespace,
                          metadata : Tuple[Tokenizer, Embedding,
@@ -560,43 +625,6 @@ class FeaturesPolyargPredictor(
         self.training_loss = state.loss
         self.num_epochs = state.epoch
         self.training_args = args
-    def _data_tensors(self, encoded_data : FeaturesPolyArgDataset,
-                      arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        tokenized_hyp_types, hyp_features, tokenized_goals, \
-            word_features, vec_features, tactic_stems, \
-            arg_types, args = zip(*sorted(encoded_data,
-                                          key=lambda s: len(s.tokenized_hyp_types),
-                                          reverse=True))
-        padded_hyps = pad_sequence([torch.LongTensor(tokenized_hyps_list)
-                                    for tokenized_hyps_list
-                                    in tokenized_hyp_types],
-                                   batch_first=True)
-        padded_hyp_features = pad_sequence([torch.FloatTensor(hyp_features_list)
-                                            for hyp_features_list
-                                            in hyp_features],
-                                           batch_first=True)
-        for arg, arg_type, hlist in zip(args, arg_types, tokenized_hyp_types):
-            if arg_type == ArgType.GOAL_TOKEN:
-                assert arg.token_idx < arg_values.max_length
-            elif arg_type == ArgType.HYP_ID:
-                assert arg.hyp_idx < len(hlist)
-        result = [padded_hyps,
-                  padded_hyp_features,
-                  torch.LongTensor([len(tokenized_hyp_type_list)
-                                    for tokenized_hyp_type_list
-                                    in tokenized_hyp_types]),
-                  torch.LongTensor(tokenized_goals),
-                  torch.LongTensor(word_features),
-                  torch.FloatTensor(vec_features),
-                  torch.LongTensor(tactic_stems),
-                  torch.LongTensor([
-                      0 if arg_type == ArgType.NO_ARG else
-                      (arg.token_idx + 1) if arg_type == ArgType.GOAL_TOKEN else
-                      (arg.hyp_idx + arg_values.max_length + 1)
-                      for arg_type, arg in zip(arg_types, args)])]
-        eprint(result, guard=arg_values.print_tensors)
-        return result
     def _get_model(self, arg_values : Namespace,
                    stem_vocab_size : int,
                    goal_vocab_size : int) \
@@ -823,6 +851,16 @@ def encodeHypsFeatureVecs(args : argparse.Namespace,
             return [0.0, 0.0]
 
     return torch.FloatTensor([features(hyp) for hyp in hyps])
+
+def extract_dataloader_args(args: argparse.Namespace) -> DataloaderArgs:
+    dargs = DataloaderArgs();
+    # dargs.max_distance = args.max_distance
+    dargs.max_length = args.max_length
+    dargs.num_keywords = args.num_keywords
+    dargs.max_string_distance = args.max_string_distance
+    dargs.max_premises = args.max_premises
+    dargs.num_relevance_samples = args.num_relevance_samples
+    return dargs
 
 def main(arg_list : List[str]) -> None:
     predictor = FeaturesPolyargPredictor()
