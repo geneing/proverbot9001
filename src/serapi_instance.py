@@ -1758,6 +1758,19 @@ def searchStrsInMsg(sexp) -> List[str]:
 def get_module_from_filename(filename : Path2) -> str:
     return Path2(filename).stem
 
+def subgoalSurjective(newsub : Obligation, oldsub : Obligation) -> bool:
+    oldhyp_terms = [get_hyp_type(hyp) for hyp in oldsub.hypotheses]
+    for newhyp_term in [get_hyp_type(hyp) for hyp in newsub.hypotheses]:
+        if newhyp_term not in oldhyp_terms:
+            return False
+    return newsub.goal == oldsub.goal
+def contextSurjective(newcontext : ProofContext, oldcontext : ProofContext):
+    for oldsub in oldcontext.all_goals:
+        if not any([subgoalSurjective(newsub, oldsub)
+                    for newsub in newcontext.all_goals]):
+            return False
+    return len(newcontext.all_goals) >= len(oldcontext.all_goals)
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=
