@@ -88,7 +88,6 @@ class TrainablePredictor(TacticPredictor, Generic[DatasetType, MetadataType, Sta
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[DatasetType, MetadataType]: pass
 
-    @abstractmethod
     def _optimize_model_to_disc(self,
                                 encoded_data : DatasetType,
                                 encdec_state : MetadataType,
@@ -99,6 +98,7 @@ class TrainablePredictor(TacticPredictor, Generic[DatasetType, MetadataType, Sta
     @abstractmethod
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : MetadataType,
                          state : StateType) -> None: pass
     pass
@@ -200,6 +200,7 @@ class TokenizingPredictor(TrainablePredictor[DatasetType, TokenizerEmbeddingStat
             TokenizerEmbeddingState(tokenizer, embedding)
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : TokenizerEmbeddingState,
                          state : StateType) -> None:
         self._tokenizer = metadata.tokenizer
@@ -322,6 +323,7 @@ class NeuralPredictor(Generic[RestrictedDatasetType, ModelType],
                                        model.state_dict())
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : TokenizerEmbeddingState,
                          state : NeuralPredictorState) -> None:
         self._tokenizer = metadata.tokenizer
