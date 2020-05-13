@@ -31,9 +31,8 @@ import tokenizer
 from tokenizer import Tokenizer
 from data import (ListDataset, normalizeSentenceLength, RawDataset,
                   EOS_token)
-from util import *
-import time
-import random
+from util import eprint, maybe_cuda, LongTensor, FloatTensor
+import math
 from format import ScrapedTactic, TacticContext, strip_scraped_output
 import serapi_instance
 from models.components import (WordFeaturesEncoder, Embedding, SimpleEmbedding,
@@ -65,7 +64,7 @@ import functools
 from itertools import islice
 from argparse import Namespace
 from typing import (List, Tuple, NamedTuple, Optional, Sequence, Dict,
-                    cast, Union, Set, Type)
+                    cast, Union, Set, Type, Any, Iterable)
 
 from enum import Enum, auto
 class ArgType(Enum):
@@ -605,7 +604,6 @@ class FeaturesPolyargPredictor(
                          unparsed_args : List[str],
                          metadata : Any,
                          state : NeuralPredictorState) -> None:
-        eprint("Loading model state dict")
         model = maybe_cuda(self._get_model(args,
                                            get_word_feature_vocab_sizes(metadata),
                                            get_vec_features_size(metadata),
