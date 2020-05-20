@@ -309,3 +309,6 @@ def split_by_char_outside_matching(openpat : str, closepat : str,
 def unwrap(a : Optional[T]) -> T:
     assert a
     return a
+
+def progn(*args):
+    return args[-1]
