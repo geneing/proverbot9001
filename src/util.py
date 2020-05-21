@@ -307,7 +307,7 @@ def split_by_char_outside_matching(openpat : str, closepat : str,
     return None
 
 def unwrap(a : Optional[T]) -> T:
-    assert a
+    assert a is not None
     return a
 
 def progn(*args):
