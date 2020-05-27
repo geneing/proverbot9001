@@ -341,6 +341,7 @@ def get_state_distances(interactions : Iterable[ScrapedCommand]) -> Iterable[Sta
             for block in blocks
             for (idx, interaction) in enumerate(block))
 
+
 def filter_data(data: Iterable[ScrapedTactic], pair_filter: ContextFilter,
                 arg_values: Namespace) -> Iterable[ScrapedTactic]:
     return (scraped
@@ -349,6 +350,8 @@ def filter_data(data: Iterable[ScrapedTactic], pair_filter: ContextFilter,
                                       [ScrapedTactic([], [], [], "", "")]))
             if pair_filter(strip_scraped_output(scraped), scraped.tactic,
                            strip_scraped_output(next_scraped), arg_values))
+
+
 def filter_eval_data(data: Iterable[StateScore], pair_filter: ContextFilter,
                      arg_values: Namespace) -> Iterable[StateScore]:
     return (point
@@ -502,18 +505,20 @@ def normalizeSentenceLength(sentence : Sentence, max_length : int) -> Sentence:
         sentence.extend([EOS_token] * (max_length - len(sentence)))
     return sentence
 
-def stemmify_data(point : ScrapedTactic) -> ScrapedTactic:
     relevant_lemmas, prev_tactics, hypotheses, goal, tactic = point
     return ScrapedTactic(relevant_lemmas, prev_tactics, hypotheses, goal, get_stem(tactic))
+
+def stemmify_data(point: ScrapedTactic) -> ScrapedTactic:
 
 def tactic_substitutions_eval(substitutions : Dict[str, str], sample : StateScore) -> StateScore:
     return StateScore(tactic_substitutions(substitutions, sample.state), sample.score)
 
 
-def tactic_substitutions(substitutions : Dict[str, str], sample : ScrapedTactic) \
-    -> ScrapedTactic:
     relevant_lemmas, prev_tactics, hyps, goal, tactic = sample
     return ScrapedTactic(relevant_lemmas, prev_tactics, hyps, goal,
+def tactic_substitutions(substitutions: Dict[str, str],
+                         sample: ScrapedTactic) \
+        -> ScrapedTactic:
                          tactic if get_stem(tactic) not in substitutions
                          else substitutions[get_stem(tactic)])
 
@@ -522,15 +527,16 @@ def truncate_tactic_semicolons_eval(sample : StateScore) -> StateScore:
 def normalizeNumericArgs_eval(sample : StateScore) -> StateScore:
     return StateScore(serapi_instance.normalizeNumericArgs(sample.state), sample.score)
 
+
 def truncate_tactic_semicolons(sample: ScrapedTactic) \
         -> ScrapedTactic:
     rl, pt, hyp, goal, tactic = sample
     newtac = tactic
-    outer_parens_match = re.fullmatch("\((.*)\)", newtac.strip())
+    outer_parens_match = re.fullmatch(r"\((.*)\)", newtac.strip())
     if outer_parens_match:
         newtac = outer_parens_match.group(1)
     splitresult = split_by_char_outside_matching(
-        "\(|\[", "\)|\]", ";", newtac)
+        r"\(|\[", r"\)|\]", ";", newtac)
     if splitresult:
         before_semi, after_semi = splitresult
         newtac = before_semi.strip() + "."
