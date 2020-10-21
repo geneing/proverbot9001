@@ -25,15 +25,21 @@ import io
 import math
 import re
 import itertools
+import argparse
 
 import torch
 import torch.cuda
 import torch.autograd as autograd
 
-from typing import List, Tuple, Iterable, Any, overload, TypeVar, Callable, Optional
+from typing import (List, Tuple, Iterable, Any, overload, TypeVar,
+                    Callable, Optional, Pattern, Match, Union)
+
+from dataloader import rust_parse_sexp_one_level
+from sexpdata import Symbol
 
 use_cuda = torch.cuda.is_available()
-assert use_cuda
+# assert use_cuda
+
 
 def maybe_cuda(component):
     if use_cuda:
@@ -111,14 +117,14 @@ def _inflate(tensor : torch.Tensor, times : int) -> torch.Tensor:
         raise ValueError("Tensor can be of 1D, 2D, or 3D only. "
                          "This one is {}D.".format(tensor_dim))
 
-def chunks(l : Iterable[Any], chunk_size : int) -> Iterable[List[Any]]:
+T = TypeVar('T')
+def chunks(l : Iterable[T], chunk_size : int) -> Iterable[List[T]]:
     i = iter(l)
     next_chunk = list(itertools.islice(i, chunk_size))
     while next_chunk:
         yield next_chunk
         next_chunk = list(itertools.islice(i, chunk_size))
 
-T = TypeVar('T')
 def list_topk(lst : List[T], k : int, f : Optional[Callable[[T], float]] = None) \
     -> Tuple[List[int], List[T]]:
     if f == None:
@@ -176,6 +182,7 @@ import sys
 def eprint(*args, **kwargs):
     if "guard" not in kwargs or kwargs["guard"]:
         print(*args, file=sys.stderr, **{i:kwargs[i] for i in kwargs if i!='guard'})
+        sys.stderr.flush()
 
 import contextlib
 
@@ -212,4 +219,125 @@ def sighandler_context(signal, f):
     old_handler = sig.signal(signal, f)
     yield
     sig.signal(signal, old_handler)
+
+@contextlib.contextmanager
+def print_time(msg : str, guard=True):
+    start = time.time()
+    eprint(msg + "...", end="", guard=guard)
+    try:
+        yield
+    finally:
+        eprint("{:.2f}s".format(time.time() - start), guard=guard)
+
 mybarfmt = '{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]'
+
+
+def split_to_next_matching(openpat : str, closepat : str, target : str) \
+    -> Tuple[str, str]:
+    counter = 1
+    openp = re.compile(openpat)
+    closep = re.compile(closepat)
+    firstmatch = openp.search(target)
+    assert firstmatch, "Coudn't find an opening pattern!"
+    curpos = firstmatch.end()
+    while counter > 0:
+        nextopenmatch = openp.search(target, curpos)
+        nextopen = nextopenmatch.end() if nextopenmatch else len(target)
+
+        nextclosematch = closep.search(target, curpos)
+        nextclose = nextclosematch.end() if nextclosematch else len(target)
+        if nextopen < nextclose:
+            counter += 1
+            assert nextopen + 1 > curpos, (target, curpos, nextopen)
+            curpos = nextopen
+        else:
+            counter -= 1
+            assert nextclose + 1 > curpos
+            curpos = nextclose
+    return target[:curpos], target[curpos:]
+
+def multisplit_matching(openpat : str, closepat : str,
+                        splitpat : str, target : str) \
+                        -> List[str]:
+    splits = []
+    nextsplit = split_by_char_outside_matching(openpat, closepat, splitpat, target)
+    rest = None
+    while nextsplit:
+        before, rest = nextsplit
+        splits.append(before)
+        nextsplit = split_by_char_outside_matching(openpat, closepat, splitpat, rest[1:])
+    if rest:
+        splits.append(rest[1:])
+    else:
+        splits.append(target)
+    return splits
+
+
+def split_by_char_outside_matching(openpat: str, closepat: str,
+                                   splitpat: str, target: str) \
+        -> Optional[Tuple[str, str]]:
+    counter = 0
+    curpos = 0
+    with silent():
+        openp = re.compile(openpat)
+        closep = re.compile(closepat)
+        splitp = re.compile(splitpat)
+
+    def search_pat(pat: Pattern) -> Tuple[Optional[Match], int]:
+        match = pat.search(target, curpos)
+        return match, match.end() if match else len(target) + 1
+
+    while curpos < len(target) + 1:
+        _, nextopenpos = search_pat(openp)
+        _, nextclosepos = search_pat(closep)
+        nextsplitchar, nextsplitpos = search_pat(splitp)
+
+        if nextopenpos < nextclosepos and nextopenpos < nextsplitpos:
+            counter += 1
+            assert nextopenpos > curpos
+            curpos = nextopenpos
+        elif nextclosepos < nextopenpos and \
+                (nextclosepos < nextsplitpos or
+                 (nextclosepos == nextsplitpos and counter > 0)):
+            counter -= 1
+            assert nextclosepos > curpos
+            curpos = nextclosepos
+        else:
+            if counter <= 0:
+                if nextsplitpos > len(target):
+                    return None
+                assert nextsplitchar
+                return target[:nextsplitchar.start()], target[nextsplitchar.start():]
+            else:
+                assert nextsplitpos > curpos
+                curpos = nextsplitpos
+    return None
+
+
+def get_possible_arg(args: argparse.Namespace, argname: str,
+                     default: Any) -> Any:
+    try:
+        return getattr(args, argname)
+    except AttributeError:
+        return default
+
+
+def parseSexpOneLevel(sexp_str: str) -> Union[List[str], int, Symbol]:
+    if sexp_str[0] == '(':
+        result = rust_parse_sexp_one_level(sexp_str)
+        return result
+    elif re.fullmatch(r"\s*\d+\s*", sexp_str):
+        return int(sexp_str.strip())
+    elif re.fullmatch(r'\s*\w+\s*', sexp_str):
+        return Symbol(sexp_str)
+    else:
+        assert False, f"Couldn't parse {sexp_str}"
+
+
+def unwrap(a: Optional[T]) -> T:
+    assert a is not None
+    return a
+
+
+def progn(*args):
+    return args[-1]

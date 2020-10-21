@@ -30,7 +30,7 @@ import statistics
 
 import torch
 from models.tactic_predictor import (TacticPredictor, Prediction,
-                                     TacticContext, TrainablePredictor,
+                                     TrainablePredictor,
                                      add_tokenizer_args)
 from models.args import take_std_args
 
@@ -41,12 +41,18 @@ from data import get_text_data, filter_data, \
     encode_bag_classify_data, encode_bag_classify_input, ScrapedTactic, RawDataset, ClassifyBagDataset
 from context_filter import get_context_filter
 from serapi_instance import get_stem
-from models.components import Embedding
+from models.components import Embedding, PredictorState
 
 from util import *
+from format import TacticContext
+from dataclasses import dataclass
 
-T = TypeVar('T')
 V = TypeVar('V')
+
+@dataclass
+class KNearestPredictorState(PredictorState, Generic[V]):
+    inner: "NearnessTree[V]"
+
 
 class SPTreeNode(Generic[V]):
     def __init__(self, value : float , axis : int,
@@ -201,11 +207,11 @@ class KNNMetadata(NamedTuple):
     tokenizer_name : str
     num_samples : int
     context_filter : str
-class KNNPredictor(TrainablePredictor[ClassifyBagDataset, KNNMetadata, NearnessTree]):
+class KNNPredictor(TrainablePredictor[ClassifyBagDataset, KNNMetadata, KNearestPredictorState]):
     def _encode_data(self, data : RawDataset, arg_values : argparse.Namespace) \
         -> Tuple[ClassifyBagDataset, KNNMetadata]:
         samples, tokenizer, embedding = \
-            encode_bag_classify_data(RawDataset(list(self._preprocess_data(data, arg_values))),
+            encode_bag_classify_data(data,
                                      tokenizers[arg_values.tokenizer],
                                      arg_values.num_keywords, 2)
         return samples, KNNMetadata(embedding, tokenizer, arg_values.tokenizer,
@@ -223,15 +229,17 @@ class KNNPredictor(TrainablePredictor[ClassifyBagDataset, KNNMetadata, NearnessT
         -> None:
         bst = NearnessTree(encoded_data)
         with open(arg_values.save_file, 'wb') as f:
-            torch.save(("k-nearest", (arg_values, encdec_state, bst)), f)
+            torch.save(("k-nearest", (arg_values, encdec_state, KNearestPredictorState(1, bst))), f)
     def load_saved_state(self,
                          args : argparse.Namespace,
+                         unparsed_args : List[str],
                          metadata : KNNMetadata,
-                         state : NearnessTree) -> None:
+                         state : KNearestPredictorState) -> None:
         self.embedding, self.tokenizer, self.tokenizer_name, \
             self.num_samples, self.context_filter = metadata
-        self.bst = state
+        self.bst = state.inner
         self.training_args = args
+        self.unparsed_args = unparsed_args
 
     def getOptions(self) -> List[Tuple[str, str]]:
         return [("# tokens", str(self.tokenizer.numTokens())),

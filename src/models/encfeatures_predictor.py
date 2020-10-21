@@ -19,17 +19,17 @@
 #
 ##########################################################################
 from models.tactic_predictor import \
-    (NeuralPredictorState, TrainablePredictor, TacticContext,
-     Prediction, save_checkpoints, optimize_checkpoints,
-     predictKTactics, predictKTacticsWithLoss,
-     predictKTacticsWithLoss_batch, add_tokenizer_args,
-     embed_data, tokenize_goals, strip_scraped_output)
+    (NeuralPredictorState, TrainablePredictor, Prediction,
+     save_checkpoints, optimize_checkpoints, predictKTactics,
+     predictKTacticsWithLoss, predictKTacticsWithLoss_batch,
+     add_tokenizer_args, embed_data, tokenize_goals)
 
 from models.components import (Embedding, SimpleEmbedding, add_nn_args)
 from data import (Sentence, ListDataset, RawDataset,
                   normalizeSentenceLength)
 from serapi_instance import get_stem
 from util import *
+from format import TacticContext, strip_scraped_output
 from tokenizer import Tokenizer
 from features import (vec_feature_constructors,
                       word_feature_constructors, VecFeature,
@@ -153,7 +153,7 @@ class EncFeaturesPredictor(TrainablePredictor[EncFeaturesDataset,
         word_features_batch = [self._get_word_features(in_data) for in_data in in_datas]
         goals_batch = [normalizeSentenceLength(self._tokenizer.toTokenList(goal),
                                                self.training_args.max_length)
-                       for _, _, goal in in_datas]
+                       for _, _, _, goal in in_datas]
         return self._model(torch.FloatTensor(vec_features_batch),
                            torch.LongTensor(word_features_batch),
                            torch.LongTensor(goals_batch))
@@ -185,20 +185,19 @@ class EncFeaturesPredictor(TrainablePredictor[EncFeaturesDataset,
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[EncFeaturesDataset, Tuple[Tokenizer, Embedding,
                                            List[VecFeature], List[WordFeature]]]:
-        preprocessed_data = list(self._preprocess_data(data, arg_values))
-        stripped_data = [strip_scraped_output(dat) for dat in preprocessed_data]
+        stripped_data = [strip_scraped_output(dat) for dat in data]
         self._vec_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
                                        feature_constructor in vec_feature_constructors]
         self._word_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
                                        feature_constructor in word_feature_constructors]
-        embedding, embedded_data = embed_data(RawDataset(preprocessed_data))
+        embedding, embedded_data = embed_data(data)
         tokenizer, tokenized_goals = tokenize_goals(embedded_data, arg_values)
         result_data = EncFeaturesDataset([EncFeaturesSample(
-            self._get_vec_features(TacticContext(prev_tactics, hypotheses, goal)),
-            self._get_word_features(TacticContext(prev_tactics, hypotheses, goal)),
+            self._get_vec_features(TacticContext([], prev_tactics, hypotheses, goal)),
+            self._get_word_features(TacticContext([], prev_tactics, hypotheses, goal)),
             normalizeSentenceLength(tokenized_goal, arg_values.max_length),
             tactic)
-                                           for (prev_tactics, hypotheses, goal, tactic),
+                                           for (relevant_lemmas, prev_tactics, hypotheses, goal, tactic),
                                            tokenized_goal in
                                            zip(embedded_data, tokenized_goals)])
         return result_data, (tokenizer, embedding,
@@ -226,6 +225,7 @@ class EncFeaturesPredictor(TrainablePredictor[EncFeaturesDataset,
                                     self._getBatchPredictionLoss(batch_tensors, model))
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : Tuple[Tokenizer, Embedding,
                                           List[VecFeature], List[WordFeature]],
                          state : NeuralPredictorState) -> None:
@@ -239,14 +239,22 @@ class EncFeaturesPredictor(TrainablePredictor[EncFeaturesDataset,
         self.training_loss = state.loss
         self.num_epochs = state.epoch
         self.training_args = args
-    def _data_tensors(self, encoded_data : EncFeaturesDataset,
-                      arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        vec_features, word_features, goals, tactics = zip(*encoded_data)
+        self.unparsed_args = unparsed_args
+
+    def _data_tensors(self, encoded_data: EncFeaturesDataset,
+                      arg_values: Namespace) \
+            -> List[torch.Tensor]:
+        vec_features, word_features, goals, tactics = \
+            cast(Tuple[List[List[float]],
+                       List[List[int]],
+                       List[Sentence],
+                       List[int]],
+                 zip(*encoded_data))
         return [torch.FloatTensor(vec_features),
                 torch.LongTensor(word_features),
                 torch.LongTensor(goals),
                 torch.LongTensor(tactics)]
+
     def _get_model(self, arg_values : Namespace,
                    tactic_vocab_size : int,
                    goal_vocab_size : int) \

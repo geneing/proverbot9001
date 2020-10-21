@@ -3,22 +3,19 @@
 import argparse
 import subprocess
 import os
-import sys
 import multiprocessing
 import re
 import datetime
-import time
 import csv
 import collections
 import itertools
 import functools
-import shutil
 import io
 import math
 
-from typing import Any, Union, Optional, Tuple, List, Sequence, Dict, Counter, \
-    Callable, NamedTuple, TextIO, Iterable, \
-    cast, TypeVar, NewType
+from typing import (Any, Union, Optional, Tuple, List, Sequence,
+                    Counter, Callable, NamedTuple, Iterable,
+                    cast, TypeVar)
 from pathlib_revised import Path2
 
 from data import file_chunks, filter_data
@@ -26,11 +23,11 @@ from context_filter import get_context_filter
 from serapi_instance import get_stem, try_load_lin, load_commands_preserve
 import serapi_instance
 from predict_tactic import static_predictors, loadPredictorByFile, loadPredictorByName
-from models.tactic_predictor import TacticPredictor, Prediction, TacticContext
+from models.tactic_predictor import TacticPredictor, Prediction
 from yattag import Doc
-from format import format_goal, format_hypothesis, format_tactic, read_tuple, \
-    ScrapedTactic, ScrapedCommand
-from syntax import syntax_highlight, strip_comments
+from format import (read_tuple, ScrapedTactic, ScrapedCommand, TacticContext,
+                    strip_scraped_output)
+from syntax import syntax_highlight, strip_comments, ColoredString
 from util import multipartition, chunks, stringified_percent, escape_filename
 
 Tag = Callable[..., Doc.Tag]
@@ -59,7 +56,11 @@ def read_text_data2_worker__(lines : List[str]) -> MixedDataset:
 def read_text_data_singlethreaded(data_path : Path2,
                                   num_threads:Optional[int]=None) -> MixedDataset:
     line_chunks = file_chunks(data_path, 32768)
-    yield from itertools.chain.from_iterable((read_text_data2_worker__(chunk) for chunk in line_chunks))
+    try:
+        yield from itertools.chain.from_iterable((read_text_data2_worker__(chunk) for chunk in line_chunks))
+    except:
+        print(f"Couldn't parse data in {str(data_path)}")
+        raise
 
 def to_list_string(l : List[Any]) -> str:
     return "% ".join([str(item) for item in l])
@@ -142,22 +143,18 @@ def report_file(args : argparse.Namespace,
                 context_filter_str : str,
                 filename : Path2) -> Optional['ResultStats']:
 
-    def make_predictions(num_predictions : int,
-                         tactic_interactions : List[ScrapedTactic]) -> \
-        Tuple[Iterable[Tuple[ScrapedTactic, List[Prediction]]], float]:
+    def make_predictions(num_predictions: int,
+                         tactic_interactions: List[ScrapedTactic]) -> \
+            Tuple[Iterable[Tuple[ScrapedTactic, List[Prediction]]], float]:
         if len(tactic_interactions) == 0:
             return [], 0
         chunk_size = args.chunk_size
         total_loss = 0.
-        for tactic_interaction in tactic_interactions:
-            assert isinstance(tactic_interaction.goal, str)
-        inputs = [TacticContext(tactic_interaction.prev_tactics,
-                                tactic_interaction.hypotheses,
-                                format_goal(tactic_interaction.goal))
+        inputs = [strip_scraped_output(tactic_interaction)
                   for tactic_interaction in tactic_interactions]
         corrects = [tactic_interaction.tactic
                     for tactic_interaction in tactic_interactions]
-        predictions : List[List[Prediction]] = []
+        predictions: List[List[Prediction]] = []
         for inputs_chunk, corrects_chunk in zip(chunks(inputs, chunk_size),
                                                 chunks(corrects, chunk_size)):
             predictions_chunk, loss = predictor.predictKTacticsWithLoss_batch(
@@ -178,39 +175,38 @@ def report_file(args : argparse.Namespace,
             yield lst.pop()[1]
         yield from list(reversed([c for _, c in lic]))
         yield from list(reversed([b for _, b in lib]))
-    def get_should_filter(data : MixedDataset) -> Iterable[Tuple[ScrapedCommand, bool]]:
-        list_data : List[ScrapedCommand] = list(data)
-        extended_list : List[Optional[ScrapedCommand]] = \
-            cast(List[Optional[ScrapedCommand]], list_data[1:])  + [None]
+
+    def get_should_filter(data: MixedDataset) \
+            -> Iterable[Tuple[ScrapedCommand, bool]]:
+        list_data: List[ScrapedCommand] = list(data)
+        extended_list: List[Optional[ScrapedCommand]] = \
+            cast(List[Optional[ScrapedCommand]], list_data[1:]) + [None]
         for point, nextpoint in zip(list_data, extended_list):
             if isinstance(point, ScrapedTactic) \
-               and not re.match("\s*[{}]\s*", point.tactic):
+               and not re.match(r"\s*[{}]\s*", point.tactic) and \
+               point.context.focused_goal.strip() != "":
                 if isinstance(nextpoint, ScrapedTactic):
-                    yield(point, not context_filter({"goal":format_goal(point.goal),
-                                                     "hyps":point.hypotheses},
-                                                    point.tactic,
-                                                    {"goal":format_goal(nextpoint.goal),
-                                                     "hyps":nextpoint.hypotheses},
-                                                    training_args))
+                    context_after = strip_scraped_output(nextpoint)
                 else:
-                    yield(point, not context_filter({"goal":format_goal(point.goal),
-                                                     "hyps":point.hypotheses},
-                                                    point.tactic,
-                                                    {"goal":"",
-                                                     "hyps":""},
-                                                    training_args))
+                    context_after = TacticContext([], [], [], "")
+                should_filter = not context_filter(strip_scraped_output(point),
+                                                   point.tactic,
+                                                   context_after,
+                                                   training_args)
+                yield (point, should_filter)
             else:
                 yield (point, True)
     try:
         scrape_path = args.prelude / filename.with_suffix(".v.scrape")
         interactions = list(read_text_data_singlethreaded(scrape_path))
-        print("Loaded {} interactions for file {}".format(len(interactions), filename))
+        print("Loaded {} interactions for file {}"
+              .format(len(interactions), filename))
     except FileNotFoundError:
         print("Couldn't find file {}, skipping...".format(scrape_path))
         return None
     context_filter = get_context_filter(context_filter_str)
 
-    command_results : List[CommandResult] = []
+    command_results: List[CommandResult] = []
     stats = ResultStats(str(filename))
     indexed_filter_aware_interactions = list(enumerate(get_should_filter(interactions)))
     for idx, (interaction, should_filter) in indexed_filter_aware_interactions:
@@ -245,20 +241,24 @@ def report_file(args : argparse.Namespace,
         if isinstance(inter, tuple) and not isinstance(inter, ScrapedTactic):
             assert len(inter) == 2, inter
             scraped, predictions_and_certainties \
-                = inter #cast(Tuple[ScrapedTactic, List[Prediction]], inter)
-            (prev_tactics, hyps, goal, correct_tactic) = scraped
-            prediction_results = [PredictionResult(prediction,
-                                                   grade_prediction(scraped,
-                                                                    prediction),
-                                                   certainty)
+                = inter  # cast(Tuple[ScrapedTactic, List[Prediction]], inter)
+            (relevant_lemmas, prev_tactics, context, correct_tactic) = scraped
+            prediction_results = [PredictionResult(
+                prediction, grade_prediction(scraped, prediction),
+                certainty)
                                   for prediction, certainty in
                                   predictions_and_certainties]
-            command_results.append(TacticResult(correct_tactic, hyps, goal,
+            command_results.append(TacticResult(correct_tactic,
+                                                context.focused_hyps,
+                                                context.focused_goal,
                                                 prediction_results))
             stats.add_tactic(prediction_results,
                              correct_tactic)
         elif isinstance(inter, ScrapedTactic):
-            command_results.append(TacticResult(inter.tactic,inter.hypotheses, inter.goal, []))
+            command_results.append(TacticResult(inter.tactic,
+                                                inter.context.focused_hyps,
+                                                inter.context.focused_goal,
+                                                []))
         else:
             command_results.append((inter,))
 
@@ -271,30 +271,33 @@ def report_file(args : argparse.Namespace,
     print("Finished output for file {}".format(filename))
     return stats
 
+
 proper_subs = {"auto.": "eauto."}
 
-def grade_prediction(correct_inter : ScrapedTactic, prediction : str):
+
+def grade_prediction(correct_inter: ScrapedTactic, prediction: str):
     correct_tactic = correct_inter.tactic
     correct_tactic_normalized = \
         serapi_instance.normalizeNumericArgs(correct_inter).tactic
     prediction_normalized = \
         serapi_instance.normalizeNumericArgs(ScrapedTactic(
-            correct_inter.prev_tactics, correct_inter.hypotheses, correct_inter.goal,
+            correct_inter.relevant_lemmas, correct_inter.prev_tactics,
+            correct_inter.context,
             prediction)).tactic
     if correct_tactic.strip() == prediction.strip() or\
        correct_tactic_normalized.strip() == prediction_normalized.strip():
         return "goodcommand"
     elif get_stem(correct_tactic).strip() == get_stem(prediction).strip():
         return "okaycommand"
-    elif correct_tactic.strip() in proper_subs and \
-         proper_subs[correct_tactic.strip()] == prediction.strip():
+    elif (correct_tactic.strip() in proper_subs and
+          proper_subs[correct_tactic.strip()] == prediction.strip()):
         return "mostlygoodcommand"
     else:
         return "badcommand"
 
-###
-### Write the report page out
-###
+#
+# Write the report page out
+#
 def write_summary(args : argparse.Namespace, options : Sequence[Tuple[str, str]],
                   cur_commit : str, cur_date : datetime.datetime,
                   individual_stats : List['ResultStats']) -> None:
@@ -366,6 +369,9 @@ def write_summary(args : argparse.Namespace, options : Sequence[Tuple[str, str]]
                         with tag('td'):
                             with tag('a', href=escape_filename(fresult.filename) + ".html"):
                                 text("Details")
+                avg_loss = 0.0
+                if combined_stats.num_tactics > 0:
+                    avg_loss = combined_stats.total_loss / combined_stats.num_tactics
                 with tag('tr'):
                     line('td', "Total");
                     line('td', str(combined_stats.num_tactics))
@@ -377,8 +383,7 @@ def write_summary(args : argparse.Namespace, options : Sequence[Tuple[str, str]]
                                                    combined_stats.num_tactics))
                     line('td', stringified_percent(combined_stats.num_topNPartial,
                                                    combined_stats.num_tactics))
-                    line('td', "{:10.2f}".format(combined_stats.total_loss /
-                                                 combined_stats.num_tactics))
+                    line('td', "{:10.2f}".format(avg_loss))
 
     base = Path2(os.path.dirname(os.path.abspath(__file__)))
     for filename in extra_files:
@@ -400,26 +405,24 @@ def header(tag : Tag, doc : Doc, text : Text, css : List[str],
             text(title)
 
 def split_into_regions(results : List[CommandResult]) -> List[List[CommandResult]]:
-    regions : List[List[CommandResult]] = []
-    curRegion : List[CommandResult] = []
-    inProof = False
-    for prev_command_result, command_result, next_command_result in \
-        zip([cast(Union[Tuple[str], TacticResult], ("None",))] + results,
-            results, results[1:]):
-        if inProof and len(command_result) == 1:
-            inProof = False
-            regions.append(curRegion + [command_result])
-            curRegion = []
-        elif not inProof and len(next_command_result) > 1:
-            inProof = True
-            if len(curRegion) > 0:
-                regions.append(curRegion)
-            curRegion = [command_result]
-        else:
-            curRegion.append(command_result)
-    if len(curRegion) > 0:
-        regions.append(curRegion)
-    return regions
+    def generate() -> Iterable[List[CommandResult]]:
+        in_proof = False
+        cur_region : List[CommandResult]= []
+        for result in results:
+            if isinstance(result, TacticResult):
+                if not in_proof:
+                    if len(cur_region) > 1:
+                        yield cur_region[:-1]
+                    cur_region = [cur_region[-1]]
+                    in_proof = True
+            else:
+                assert isinstance(result[0], str), result[0]
+                if in_proof:
+                    yield cur_region
+                    cur_region = []
+                    in_proof = False
+            cur_region.append(result)
+    return list(generate())
 
 def count_region_unfiltered(commands : List[CommandResult]):
     num_unfiltered = 0
@@ -437,6 +440,18 @@ def write_html(output_dir : Path2, filename : Path2, command_results : List[Comm
         header(tag, doc, text, details_css, details_javascript,
                "Proverbot Detailed Report for {}".format(filename))
     doc, tag, text, line = Doc().ttl()
+    def write_highlighted(vernac : str) -> None:
+        nonlocal text
+        nonlocal tag
+        substrings = syntax_highlight(vernac)
+
+        for substring in substrings:
+            if isinstance(substring, ColoredString):
+                with tag('span', style=f'color:{substring.color}'):
+                    text(substring.contents)
+            else:
+                text(substring)
+
     with tag('html'):
         details_header(tag, doc, text, filename)
         with tag('div', id='overlay', onclick='event.stopPropagation();'):
@@ -454,79 +469,74 @@ def write_html(output_dir : Path2, filename : Path2, command_results : List[Comm
                     for cmd_idx, command_result in enumerate(region):
                         assert isinstance(command_result[0], str)
                         with tag('code', klass='plaincommand'):
-                            text("\n" + command_result[0].strip('\n'))
+                            write_highlighted(command_result[0])
                 else:
                     doc.stag("br")
                     with tag('button', klass='collapsible',
                              id='collapsible-{}'.format(region_idx)):
                         with tag('code', klass='buttontext'):
                             assert isinstance(region[0][0], str), region
-                            text(region[0][0].strip("\n"))
+                            write_highlighted(region[0][0].strip("\n"))
                         num_unfiltered = count_region_unfiltered(region)
                         with tag('code', klass='numtacs ' +
                                  ('nonempty' if num_unfiltered > 3 else 'empty')):
                             text(num_unfiltered)
                     with tag('div', klass='region'):
                         for cmd_idx, command_result in enumerate(region[1:]):
-                            if len(command_result) == 1:
-                                assert isinstance(command_result[0], str)
-                                with tag('code', klass='plaincommand'):
-                                    text("\n" + command_result[0].strip('\n'))
+                            command, hyps, goal, prediction_results = \
+                                cast(TacticResult, command_result)
+                            predictions : List[str]
+                            grades : List[str]
+                            certainties : List[float]
+                            if len(prediction_results) > 0:
+                                predictions, grades, certainties = zip(*prediction_results) # type: ignore
                             else:
-                                command, hyps, goal, prediction_results = \
-                                    cast(TacticResult, command_result)
-                                predictions : List[str]
-                                grades : List[str]
-                                certainties : List[float]
-                                if len(prediction_results) > 0:
-                                    predictions, grades, certainties = zip(*prediction_results) # type: ignore
+                                predictions, grades, certainties = [], [], []
+                            with tag('span',
+                                     ('data-hyps',"\n".join(hyps)),
+                                     ('data-goal',goal),
+                                     ('data-num-total', str(stats.num_tactics)),
+                                     ('data-predictions',
+                                      to_list_string(cast(List[str], predictions))),
+                                     ('data-num-predicteds',
+                                      to_list_string([stats.predicted_tactic_frequency
+                                                      .get(get_stem(prediction), 0)
+                                                      for prediction in cast(List[str],
+                                                                             predictions)])),
+                                     ('data-num-corrects',
+                                      to_list_string([stats.correctly_predicted_frequency
+                                                      .get(get_stem(prediction), 0)
+                                                      for prediction in
+                                                      cast(List[str], predictions)])),
+                                     ('data-certainties',
+                                      to_list_string(cast(List[float], certainties))),
+                                     ('data-num-actual-corrects',
+                                      stats.correctly_predicted_frequency
+                                      .get(get_stem(command), 0)),
+                                     ('data-num-actual-in-file',
+                                      stats.actual_tactic_frequency
+                                      .get(get_stem(command), 0)),
+                                     ('data-actual-tactic',
+                                      strip_comments(command)),
+                                     ('data-grades',
+                                      to_list_string(cast(List[str], grades))),
+                                     ('data-search-idx', 0),
+                                     id='command-{}-{}'.format(region_idx, cmd_idx),
+                                     onmouseover='hoverTactic("{}-{}")'\
+                                     .format(region_idx, cmd_idx),
+                                     onmouseout='unhoverTactic()',
+                                     onclick='selectTactic("{}-{}"); event.stopPropagation();'
+                                     .format(region_idx, cmd_idx)):
+                                doc.stag("br")
+                                if len(grades) == 0:
+                                    with tag('code', klass="plaincommand"):
+                                        write_highlighted(command.strip("\n"))
                                 else:
-                                    predictions, grades, certainties = [], [], []
-                                with tag('span',
-                                         ('data-hyps',"\n".join(hyps)),
-                                         ('data-goal',format_goal(goal)),
-                                         ('data-num-total', str(stats.num_tactics)),
-                                         ('data-predictions',
-                                          to_list_string(cast(List[str], predictions))),
-                                         ('data-num-predicteds',
-                                          to_list_string([stats.predicted_tactic_frequency
-                                                          .get(get_stem(prediction), 0)
-                                                          for prediction in cast(List[str],
-                                                                                 predictions)])),
-                                         ('data-num-corrects',
-                                          to_list_string([stats.correctly_predicted_frequency
-                                                          .get(get_stem(prediction), 0)
-                                                          for prediction in
-                                                          cast(List[str], predictions)])),
-                                         ('data-certainties',
-                                          to_list_string(cast(List[float], certainties))),
-                                         ('data-num-actual-corrects',
-                                          stats.correctly_predicted_frequency
-                                          .get(get_stem(command), 0)),
-                                         ('data-num-actual-in-file',
-                                          stats.actual_tactic_frequency
-                                          .get(get_stem(command), 0)),
-                                         ('data-actual-tactic',
-                                          strip_comments(command)),
-                                         ('data-grades',
-                                          to_list_string(cast(List[str], grades))),
-                                         ('data-search-idx', 0),
-                                         id='command-{}-{}'.format(region_idx, cmd_idx),
-                                         onmouseover='hoverTactic("{}-{}")'\
-                                         .format(region_idx, cmd_idx),
-                                         onmouseout='unhoverTactic()',
-                                         onclick='selectTactic("{}-{}"); event.stopPropagation();'
-                                         .format(region_idx, cmd_idx)):
-                                    doc.stag("br")
-                                    if len(grades) == 0:
-                                        with tag('code', klass="plaincommand"):
-                                            text(command.strip("\n"))
-                                    else:
-                                        with tag('code', klass=grades[0]):
-                                            text(command.strip("\n"))
-                                        for grade in grades[1:]:
-                                            with tag('span', klass=grade):
-                                                doc.asis(" &#11044;")
+                                    with tag('code', klass=grades[0]):
+                                        text(command.strip("\n"))
+                                    for grade in grades[1:]:
+                                        with tag('span', klass=grade):
+                                            doc.asis(" &#11044;")
     with (output_dir / escape_filename(str(filename))).with_suffix(".html")\
                                                       .open(mode='w') as fout:
         fout.write(doc.getvalue())

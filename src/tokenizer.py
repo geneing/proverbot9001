@@ -46,14 +46,26 @@ class Tokenizer(metaclass=ABCMeta):
     def listTokens(self) -> List[str]:
         pass
 
-def get_words(string : str) -> List[str]:
-    return [word for word in
-            re.sub('(,|\.+|(?::(?!=))|(?::=)|\)|\()', r' \1 ', string).split()
+
+symbols_regexp = (r',|(?::>)|(?::(?!=))|(?::=)|\)|\(|;|@\{|~|\+{1,2}|\*{1,2}|&&|\|\||'
+                  r'(?<!\\)/(?!\\)|/\\|\\/|(?<![<*+-/|&])=(?!>)|%|(?<!<)-(?!>)|'
+                  r'<-|->|<=|>=|<>|\^|\[|\]|(?<!\|)\}|\{(?!\|)')
+
+
+def get_words(string: str) -> List[str]:
+    return [word for word in re.sub(
+        r'(\.+|' + symbols_regexp + ')',
+        r' \1 ',
+        string).split()
             if word.strip() != '']
 
-def get_symbols(string : str) -> List[str]:
-    return [word for word in re.sub('(,|(?::(?!=))|(?::=)|\)|\(|;)', r' \1 ', string).split()
+
+def get_symbols(string: str) -> List[str]:
+    return [word for word in re.sub(
+        r'(' + symbols_regexp + ')',
+        r' \1 ', string).split()
             if word.strip() != '']
+
 
 def get_topk_keywords_worker__(sentence_list : List[str]) -> collections.Counter:
     counts : Counter[str] = collections.Counter()
@@ -238,6 +250,7 @@ class CompleteTokenizer(Tokenizer):
         self.use_unknowns = use_unknowns
         pass
     def toTokenList(self, string : str) -> List[int]:
+        string = unescape(string)
         words = get_words(string)
         tokens : List[int] = []
         for word in words:
@@ -249,14 +262,16 @@ class CompleteTokenizer(Tokenizer):
     def toString(self, tokenlist : List[int]) -> str:
         result = ""
         for token in tokenlist:
-            assert token >= self.num_reserved_tokens and \
-                token <= self.num_reserved_tokens + len(self.keywords)
+            assert token <= self.num_reserved_tokens + len(self.keywords)
             if result != "":
                 result += " "
             if token == self.num_reserved_tokens + len(self.keywords):
                 result += "UNKNOWN"
             else:
-                result += self.keywords[token - self.num_reserved_tokens]
+                if token < self.num_reserved_tokens:
+                    result += "RES"
+                else:
+                    result += self.keywords[token - self.num_reserved_tokens]
         return result
     def numTokens(self) -> int:
         return self.num_reserved_tokens + len(self.keywords) + 1
@@ -321,6 +336,11 @@ class KeywordTokenizer(Tokenizer):
 
     def listTokens(self) -> List[str]:
         return self.keywords
+
+
+def unescape(s: str) -> str:
+    return s.replace("\\.", ".").replace("\\\\", "\\")
+
 
 def make_keyword_tokenizer_relevance(data : List[Tuple[str, int]],
                                      tokenizer_type : Callable[[List[str], int],

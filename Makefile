@@ -21,8 +21,12 @@ ifneq ($(MESSAGE),)
 FLAGS+=-m "$(MESSAGE)"
 endif
 REPORT="report"
+WEIGHTSFILE='data/polyarg-weights.dat'
 TESTFILES=$(patsubst %, CompCert/%, $(shell cat data/compcert-test-files.txt))
+COMPCERT_TRAIN_FILES=$(patsubst %, CompCert/%, $(shell cat data/compcert-train-files.txt))
 TESTSCRAPES=$(patsubst %,%.scrape,$(TESTFILES))
+CC_TRAIN_SCRAPES=$(patsubst %,%.scrape,$(COMPCERT_TRAIN_FILES))
+DATALOADER_SRC=$(wildcard dataloader/dataloader-core/src/*.rs) $(wildcard dataloader/dataloader-core/src/**/*.rs)
 
 .PHONY: scrape report setup static-report dynamic-report search-report
 
@@ -31,23 +35,28 @@ all: scrape report
 setup:
 	./src/setup.sh && $(MAKE) publish-depv
 
+data/compcert-scrape.txt: $(CC_TRAIN_SCRAPES)
+	cat $(CC_TRAIN_SCRAPES) > $@
+
 scrape:
 	cp data/scrape.txt data/scrape.bkp 2>/dev/null || true
 	cd src && \
-	cat ../data/compcert-train-files.txt | $(HEAD_CMD) | \
+	cat ../data/coq-projects-train-files.txt | $(HEAD_CMD) | \
 	xargs python3.7 scrape.py $(FLAGS) -v -c -j $(NTHREADS) --output ../data/scrape.txt \
-				        		 --prelude ../CompCert
+				        		 --prelude ../coq-projects
 data/scrape-test.txt: $(TESTSCRAPES)
 	cat $(TESTSCRAPES) > $@
 CompCert/%.scrape: CompCert/%
-	python3.7 src/scrape.py $(FLAGS) -v -c -j 1 --prelude=./CompCert $* > /dev/null
+	python3 src/scrape.py $(FLAGS) -c -j 1 --prelude=./CompCert $* -o /dev/null || true
 
 report: $(TESTSCRAPES)
 	($(ENV_PREFIX) ; cat data/compcert-test-files.txt | $(HEAD_CMD) | \
 	xargs ./src/proverbot9001.py static-report -j $(NTHREADS) --weightsfile=data/polyarg-weights.dat --prelude ./CompCert $(FLAGS))
 
+compcert-train: data/compcert-scrape.txt src/dataloader.so
+	./src/proverbot9001.py train polyarg data/compcert-scrape.txt data/polyarg-weights.dat --load-tokens=tokens.txt --context-filter="(goal-args+((tactic:induction+tactic:destruct)%numeric-args)+hyp-args+rel-lemma-args)%maxargs:1%default" $(FLAGS) #--hidden-size $(HIDDEN_SIZE)
 train:
-	./src/proverbot9001.py train polyarg data/scrape.txt data/polyarg-weights.dat --load-tokens=tokens.pickle --save-tokens=tokens.pickle --context-filter="(goal-args+((tactic:induction+tactic:destruct)%numeric-args)+hyp-args)%maxargs:1%default" $(FLAGS) #--hidden-size $(HIDDEN_SIZE)
+	./src/proverbot9001.py train polyarg data/scrape.txt data/polyarg-weights.dat --load-tokens=tokens.txt --save-tokens=tokens.pickle --context-filter="(goal-args+((tactic:induction+tactic:destruct)%numeric-args)+hyp-args+rel-lemma-args)%maxargs:1%default" $(FLAGS) #--hidden-size $(HIDDEN_SIZE)
 
 static-report: $(TESTSCRAPES)
 	($(ENV_PREFIX) ; cat data/compcert-test-files.txt | $(HEAD_CMD) | \
@@ -59,16 +68,17 @@ dynamic-report:
 
 search-report:
 	($(ENV_PREFIX) ; cat data/compcert-test-files.txt | $(HEAD_CMD) | \
-	xargs ./src/proverbot9001.py search-report -j $(NTHREADS) --weightsfile=data/polyarg-weights.dat --prelude=./CompCert --search-depth=5 --search-width=5 -P $(FLAGS))
+	xargs ./src/proverbot9001.py search-report -j $(NTHREADS) --weightsfile=data/polyarg-weights.dat --prelude=./CompCert --search-depth=6 --search-width=3 -P $(FLAGS))
 
 search-test:
 	./src/proverbot9001.py search-report -j $(NTHREADS) --weightsfile=data/polyarg-weights.dat --prelude=./CompCert --search-depth=5 --search-width=5 -P --use-hammer -o=test-report --debug ./backend/Locations.v $(FLAGS)
 
 scrape-test:
 	cp data/scrape.txt data/scrape.bkp 2>/dev/null || true
-	cat data/coqgym-demo-files.txt | $(HEAD_CMD) | \
-	xargs python3 src/scrape.py $(FLAGS) -v -c -j $(NTHREADS) --output data/scrape-test.txt \
-				        		 --prelude=./coq-projects/zfc
+	cd src && \
+	cat ../data/coq-projects-train-files.txt | tail -n +320 | head -n 50 | \
+	xargs python3.7 scrape.py $(FLAGS) -v -c -j $(NTHREADS) --output ../data/scrape.txt \
+				        		 --prelude ../coq-projects
 
 INDEX_FILES=index.js index.css build-index.py
 
@@ -85,7 +95,7 @@ publish:
 	mv $(REPORT) $(REPORT_NAME)
 	chmod +rx $(REPORT_NAME)
 	tar czf report.tar.gz $(REPORT_NAME)
-	rsync -avz report.tar.gz $(SITE_PATH)/reports/
+	rsync -avzP report.tar.gz $(SITE_PATH)/reports/
 	ssh goto 'cd ~alexss/proverbot9001-site/reports && \
                   tar xzf report.tar.gz && \
                   rm report.tar.gz && \
@@ -95,9 +105,8 @@ publish:
 	$(MAKE) update-index
 
 publish-weights:
-	tar czf data/pytorch-weights.tar.gz data/*.dat
-	rsync -avzP data/pytorch-weights.tar.gz goto:proverbot9001-site/downloads/weights-`date -I`.tar.gz
-	ssh goto ln -f proverbot9001-site/downloads/weights-`date -I`.tar.gz proverbot9001-site/downloads/weights-latest.tar.gz
+	rsync -avzP $(WEIGHTSFILE) goto:proverbot9001-site/downloads/weights-`date -I`.dat
+	ssh goto ln -f proverbot9001-site/downloads/weights-`date -I`.dat proverbot9001-site/downloads/weights-latest.dat
 
 download-weights:
 	curl -o data/pytorch-weights.tar.gz proverbot9001.ucsd.edu/downloads/weights-latest.tar.gz
@@ -106,9 +115,22 @@ download-weights:
 publish-depv:
 	opam info -f name,version menhir ocamlfind ppx_deriving ppx_import cmdliner core_kernel sexplib ppx_sexp_conv camlp5 | awk '{print; print ""}' > known-good-dependency-versions.md
 
+src/dataloader.so: $(DATALOADER_SRC) dataloader/dataloader.pyi
+	cd dataloader && cargo build --release
+	cp dataloader/target/release/libdataloader.so src/dataloader.so
+	cp dataloader/dataloader.pyi src/
+
 clean:
 	rm -rf report-*
 	rm -f log*.txt
+
+clean-scrape:
+	for file in `find CompCert -name "*.scrape"` ; do \
+            mv $$file $$file.bkp; \
+        done
+
+clean-test-scrape:
+	rm -r $(TESTSCRAPES)
 
 clean-progress:
 	fd '.*\.v\.lin' CompCert | xargs rm -f

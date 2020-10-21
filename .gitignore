@@ -1,6 +1,7 @@
 /.gcroots/
 *__pycache__/
 /CompCert/
+/coq-projects/
 /coq/
 /coq-serapi/
 /darknet/
@@ -13,6 +14,7 @@
 /data/scrape.bkp
 report-*
 report/
-*weights*
+*-weights*
 *.mypy_cache/*
 */.mypy_cache/*
+*.lock

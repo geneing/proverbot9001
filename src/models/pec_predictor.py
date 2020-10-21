@@ -20,13 +20,13 @@
 #
 ##########################################################################
 
-from models.tactic_predictor import (NeuralClassifier, TacticContext,
-                                     Prediction)
+from models.tactic_predictor import (NeuralClassifier, Prediction)
 from models.components import Embedding
 from data import (Sentence, Dataset, TokenizedDataset,
                   normalizeSentenceLength)
 from serapi_instance import get_stem
 from util import *
+from format import TacticContext
 from tokenizer import Tokenizer
 
 import torch
@@ -129,7 +129,7 @@ class PECPredictor(NeuralClassifier[PECDataset, 'PEClassifier']):
             goals_tensor = LongTensor([
                 normalizeSentenceLength(self._tokenizer.toTokenList(goal),
                                         self.training_args.max_length)
-                for prev_tactics, hypotheses, goal in in_data])
+                for relevant_lemmas, prev_tactics, hypotheses, goal in in_data])
             prevs_tensor = LongTensor([self._get_prev(in_datum) for in_datum in in_data])
             correct_stems = [get_stem(correct) for correct in corrects]
             prediction_distributions = self._model.run(goals_tensor, prevs_tensor)
@@ -167,9 +167,13 @@ class PECPredictor(NeuralClassifier[PECDataset, 'PEClassifier']):
                 get_stem(prev_tactics[-1]) if len(prev_tactics) > 1 else "Proof"),
                                      goal, tactic)
                            for prev_tactics, goal, tactic in data])
-    def _data_tensors(self, encoded_data : PECDataset, arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        prevs, goals, nexts = zip(*encoded_data)
+
+    def _data_tensors(self, encoded_data: PECDataset, arg_values: Namespace) \
+            -> List[torch.Tensor]:
+        prevs, goals, nexts = cast(Tuple[List[int],
+                                         List[Sentence],
+                                         List[int]],
+                                   zip(*encoded_data))
         goal_stream = torch.LongTensor([
             normalizeSentenceLength(goal, arg_values.max_length)
             for goal in goals])

@@ -1,63 +1,111 @@
+##########################################################################
+#
+#    This file is part of Proverbot9001.
+#
+#    Proverbot9001 is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    Proverbot9001 is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Proverbot9001.  If not, see <https://www.gnu.org/licenses/>.
+#
+#    Copyright 2019 Alex Sanchez-Stern and Yousef Alhessi
+#
+##########################################################################
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from torch.nn.utils.rnn import pack_sequence, pad_sequence
+from torch.nn.utils.rnn import pad_sequence
 
-from features import (WordFeature, VecFeature,
-                      word_feature_constructors, vec_feature_constructors)
+from features import (WordFeature, VecFeature, Feature,
+                      word_feature_constructors, vec_feature_constructors,
+                      load_features)
 import tokenizer
-from tokenizer import Tokenizer
-from data import (ListDataset, normalizeSentenceLength, RawDataset,
-                  EmbeddedSample, EOS_token)
-from util import *
-from format import ScrapedTactic
+import re
+from tokenizer import Tokenizer, get_symbols
+from data import (ListDataset, RawDataset,
+                  EOS_token)
+from util import (eprint, maybe_cuda, LongTensor, FloatTensor,
+                  print_time, split_by_char_outside_matching)
+import math
+from format import TacticContext
 import serapi_instance
 from models.components import (WordFeaturesEncoder, Embedding,
                                DNNClassifier, EncoderDNN, EncoderRNN,
                                add_nn_args)
 from models.tactic_predictor import (TrainablePredictor,
-                                     NeuralPredictorState,
-                                     TacticContext, Prediction,
-                                     optimize_checkpoints,
-                                     save_checkpoints, tokenize_goals,
-                                     embed_data, add_tokenizer_args,
-                                     strip_scraped_output)
+                                     NeuralPredictorState, Prediction,
+                                     optimize_checkpoints, add_tokenizer_args)
+import dataloader
+from dataloader import (features_polyarg_tensors,
+                        features_polyarg_tensors_with_meta,
+                        sample_fpa,
+                        sample_fpa_batch,
+                        decode_fpa_result,
+                        decode_fpa_stem,
+                        decode_fpa_arg,
+                        features_vocab_sizes,
+                        get_num_tokens,
+                        get_num_indices,
+                        get_word_feature_vocab_sizes,
+                        get_vec_features_size,
+                        DataloaderArgs,
+                        get_fpa_words)
 
-import threading
-import multiprocessing
 import argparse
 import sys
-import functools
+import re
 from itertools import islice
 from argparse import Namespace
 from typing import (List, Tuple, NamedTuple, Optional, Sequence, Dict,
-                    cast, Union)
+                    cast, Union, Set, Type, Any, Iterable)
 
 from enum import Enum, auto
+
+
 class ArgType(Enum):
     HYP_ID = auto()
     GOAL_TOKEN = auto()
     NO_ARG = auto()
 
+
 class HypIdArg(NamedTuple):
-    hyp_idx : int
+    hyp_idx: int
+
+
 class GoalTokenArg(NamedTuple):
-    token_idx : int
+    token_idx: int
+
 
 TacticArg = Optional[Union[HypIdArg, GoalTokenArg]]
 
+
 class FeaturesPolyArgSample(NamedTuple):
-    tokenized_hyp_types : List[List[int]]
-    hyp_features : List[List[float]]
-    tokenized_goal : List[int]
-    word_features : List[int]
-    vec_features : List[float]
-    tactic_stem : int
-    arg_type : ArgType
-    arg : TacticArg
+    num_hyps: int
+    tokenized_hyp_types: List[List[int]]
+    hyp_features: List[List[float]]
+    tokenized_goal: List[int]
+    word_features: List[int]
+    vec_features: List[float]
+    tactic_stem: int
+    arg_type: ArgType
+    arg: TacticArg
+
 
 class FeaturesPolyArgDataset(ListDataset[FeaturesPolyArgSample]):
     pass
+
+
+FeaturesPolyargState = Tuple[Any, NeuralPredictorState]
+
 
 class GoalTokenArgModel(nn.Module):
     def __init__(self, stem_vocab_size : int,
@@ -75,18 +123,29 @@ class GoalTokenArgModel(nn.Module):
         goal_var = maybe_cuda(Variable(goal_batch))
         stem_var = maybe_cuda(Variable(stem_batch))
         batch_size = goal_batch.size()[0]
-        assert  stem_batch.size()[0] == batch_size
+        assert stem_batch.size()[0] == batch_size
         initial_hidden = self._stem_embedding(stem_var)\
                              .view(1, batch_size, self.hidden_size)
         hidden = initial_hidden
         copy_likelyhoods : List[torch.FloatTensor] = []
         for i in range(goal_batch.size()[1]):
-            token_batch = self._token_embedding(goal_var[:,i])\
-                .view(1, batch_size, self.hidden_size)
-            token_batch = F.relu(token_batch)
-            token_out, hidden = self._gru(token_batch, hidden)
-            copy_likelyhood = self._likelyhood_layer(F.relu(token_out))
-            copy_likelyhoods.append(copy_likelyhood[0])
+            try:
+                token_batch = self._token_embedding(goal_var[:,i])\
+                                  .view(1, batch_size, self.hidden_size)
+                token_batch2 = F.relu(token_batch)
+                token_out, hidden = self._gru(token_batch2, hidden)
+                copy_likelyhood = self._likelyhood_layer(F.relu(token_out))
+                copy_likelyhoods.append(copy_likelyhood[0])
+            except RuntimeError:
+                eprint("Tokenized goal:")
+                for j in range(goal_batch.size()[0]):
+                    eprint(goal_batch[j, i].item(), end=" ")
+                    assert goal_batch[j, i] < 123
+                eprint()
+                eprint(f"goal_var: {goal_var}")
+                eprint("Token batch")
+                eprint(token_batch)
+                raise
         end_token_embedded = self._token_embedding(LongTensor([EOS_token])
                                                    .expand(batch_size))\
                                                    .view(1, batch_size, self.hidden_size)
@@ -95,6 +154,7 @@ class GoalTokenArgModel(nn.Module):
         copy_likelyhoods.insert(0, final_likelyhood[0])
         catted = torch.cat(copy_likelyhoods, dim=1)
         return catted
+
 
 class HypArgModel(nn.Module):
     def __init__(self, goal_data_size : int,
@@ -109,6 +169,7 @@ class HypArgModel(nn.Module):
         self._in_hidden = maybe_cuda(EncoderDNN(hidden_size + goal_data_size, hidden_size, hidden_size, 1))
         self._hyp_gru = maybe_cuda(nn.GRU(hidden_size, hidden_size))
         self._likelyhood_decoder = maybe_cuda(EncoderDNN(hidden_size + hyp_features_size, hidden_size, 1, 2))
+
     def forward(self, stems_batch : torch.LongTensor,
                 goals_encoded_batch : torch.FloatTensor, hyps_batch : torch.LongTensor,
                 hypfeatures_batch : torch.FloatTensor):
@@ -139,25 +200,22 @@ class HypArgModel(nn.Module):
 
 class FeaturesClassifier(nn.Module):
     def __init__(self,
-                 word_features : List[WordFeature],
-                 vec_features : List[VecFeature],
+                 wordf_sizes : List[int],
+                 vecf_size : int,
                  hidden_size : int,
                  num_layers : int,
                  stem_vocab_size : int)\
         -> None:
         super().__init__()
-        feature_vec_size = sum([feature.feature_size()
-                                for feature in vec_features])
-        word_features_vocab_sizes = [features.vocab_size()
-                                     for features in word_features]
         self._word_features_encoder = maybe_cuda(
-            WordFeaturesEncoder(word_features_vocab_sizes,
+            WordFeaturesEncoder(wordf_sizes,
                                 hidden_size, 1, hidden_size))
         self._features_classifier = maybe_cuda(
-            DNNClassifier(hidden_size + feature_vec_size,
+            DNNClassifier(hidden_size + vecf_size,
                           hidden_size, stem_vocab_size, num_layers))
         self._softmax = maybe_cuda(nn.LogSoftmax(dim=1))
         pass
+
     def forward(self,
                 word_features_batch : torch.LongTensor,
                 vec_features_batch : torch.FloatTensor) -> torch.FloatTensor:
@@ -187,105 +245,270 @@ class FeaturesPolyargPredictor(
                            NeuralPredictorState]):
     def __init__(self) -> None:
         self._criterion = maybe_cuda(nn.NLLLoss())
-        self._lock = threading.Lock()
         self.training_args : Optional[argparse.Namespace] = None
         self.training_loss : Optional[float] = None
         self.num_epochs : Optional[int] = None
-        self._word_feature_functions: Optional[List[WordFeature]] = None
-        self._vec_feature_functions: Optional[List[VecFeature]] = None
+        # self._word_feature_functions: Optional[List[WordFeature]] = None
+        # self._vec_feature_functions: Optional[List[VecFeature]] = None
         self._softmax = maybe_cuda(nn.LogSoftmax(dim=1))
         self._softmax2 = maybe_cuda(nn.LogSoftmax(dim=2))
-        self._tokenizer : Optional[Tokenizer] = None
-        self._embedding : Optional[Embedding] = None
+        # self._tokenizer : Optional[Tokenizer] = None
+        # self._embedding : Optional[Embedding] = None
         self._model : Optional[FeaturesPolyArgModel] = None
-    def predictKTactics(self, context : TacticContext, k : int) -> List[Prediction]:
-        assert self._tokenizer
-        assert self._embedding
+
+    def train(self, args : List[str]) -> None:
+        argparser = argparse.ArgumentParser(self._description())
+        self.add_args_to_parser(argparser)
+        arg_values = argparser.parse_args(args)
+        save_states = self._optimize_model(arg_values)
+
+        for metadata, state in save_states:
+            with open(arg_values.save_file, 'wb') as f:
+                torch.save((self.shortname(), (arg_values, sys.argv, metadata, state)), f)
+
+    def predictKTactics_batch(self, context_batch: List[TacticContext],
+                              k: int) \
+            -> List[List[Prediction]]:
         assert self.training_args
         assert self._model
-        beam_width=min(self.training_args.max_beam_width, k ** 2)
-        num_hyps = len(context.hypotheses)
 
-        num_stem_poss = self._embedding.num_tokens()
-        stem_width = min(beam_width, num_stem_poss)
+        num_stem_poss = get_num_tokens(self._metadata)
+        stem_width = min(self.training_args.max_beam_width, num_stem_poss,
+                         k ** 2)
+        batch_size = len(context_batch)
 
-        with self._lock:
+        tprems_batch, pfeat_batch, \
+            nhyps_batch, tgoals_batch, \
+            goal_masks_batch, \
+            wfeats_batch, vfeats_batch = \
+            sample_fpa_batch(extract_dataloader_args(self.training_args),
+                             self._metadata,
+                             [context_py2r(context)
+                              for context in context_batch])
+        for tprem, pfeat, nhyp, tgoal, masks, wfeat, vfeat, context \
+            in zip(tprems_batch, pfeat_batch,
+                   nhyps_batch, tgoals_batch,
+                   goal_masks_batch, wfeats_batch,
+                   vfeats_batch, context_batch):
+            s_tprem, s_pfeat, s_nhyp, s_tgoal, s_masks, s_wfeat, s_vfeat = \
+                sample_fpa(extract_dataloader_args(self.training_args),
+                           self._metadata,
+                           context.relevant_lemmas,
+                           context.prev_tactics,
+                           context.hypotheses,
+                           context.goal)
+            assert len(s_tprem) == 1
+            assert len(tprem) == len(s_tprem[0])
+            for p1, p2 in zip(tprem, s_tprem[0]):
+                assert p1 == p2, (p1, p2)
+            assert len(s_pfeat) == 1
+            assert len(pfeat) == len(s_pfeat[0])
+            for f1, f2 in zip(pfeat, s_pfeat[0]):
+                assert f1 == f2, (f1, f2)
+            assert s_nhyp[0] == nhyp, (s_nhyp[0], nhyp)
+            assert s_tgoal[0] == tgoal, (s_tgoal[0], tgoal)
+            assert s_masks[0] == masks, (s_masks[0], masks)
+            assert s_wfeat[0] == wfeat, (s_wfeat[0], wfeat)
+            assert s_vfeat[0] == vfeat, (s_vfeat[0], vfeat)
 
-            word_features, vec_features = self.encodeFeatureVecs([context])
-            stem_distribution = self._model.stem_classifier(word_features, vec_features)
-            stem_certainties, stem_idxs = stem_distribution.topk(stem_width)
+        stem_distribution = self._model.stem_classifier(
+            LongTensor(wfeats_batch), FloatTensor(vfeats_batch))
+        stem_certainties_batch, stem_idxs_batch = stem_distribution.topk(
+            stem_width)
 
-            goals_batch = LongTensor([self.encodeStrTerm(context.goal)])
-            goal_arg_values = self._model.goal_args_model(
-                stem_idxs.view(1 * stem_width),
-                goals_batch.view(1, 1, self.training_args.max_length)\
-                .expand(-1, stem_width, -1).contiguous()\
-                .view(1 * stem_width,
-                      self.training_args.max_length))\
-                      .view(1, stem_width, self.training_args.max_length + 1)
-            goal_symbols = tokenizer.get_symbols(context.goal)
-            for i in range(len(goal_symbols) + 1, goal_arg_values.size()[2]):
-                goal_arg_values[:, :, i] = -float("Inf")
-            assert goal_arg_values.size() == torch.Size([1, stem_width,
-                                                         self.training_args.max_length + 1]),\
-                "goal_arg_values.size(): {}; stem_width: {}".format(goal_arg_values.size(),
-                                                                    stem_width)
+        goals_batch = LongTensor(tgoals_batch)
 
-            num_probs = 1 + len(context.hypotheses) + self.training_args.max_length
-            if len(context.hypotheses) > 0:
-                encoded_goals = self._model.goal_encoder(goals_batch)\
-                                           .view(1, 1, self.training_args.hidden_size)
+        goal_arg_values = self._model.goal_args_model(
+            stem_idxs_batch.view(batch_size * stem_width),
+            goals_batch.view(batch_size, 1, self.training_args.max_length)
+            .expand(-1, stem_width, -1).contiguous()
+            .view(batch_size * stem_width,
+                  self.training_args.max_length))\
+                                     .view(batch_size, stem_width,
+                                           self.training_args.max_length + 1)
 
-                hyps_batch = LongTensor([[self.encodeStrTerm(hyp)
-                                          for hyp in context.hypotheses]])
-                assert hyps_batch.size() == torch.Size([1, num_hyps,
-                                                        self.training_args.max_length])
-                hyps_batch_expanded = hyps_batch.expand(stem_width, -1, -1)\
-                                                .contiguous()\
-                                                .view(stem_width * num_hyps,
-                                                      self.training_args.max_length)
+        goal_arg_values = torch.where(torch.ByteTensor(goal_masks_batch).view(
+            batch_size, 1, self.training_args.max_length+1)
+                                      .expand(-1, stem_width, -1),
+                                      goal_arg_values,
+                                      torch.full_like(goal_arg_values,
+                                                      -float("Inf")))
 
-                hypfeatures_batch = self.encodeHypsFeatureVecs(context.goal,
-                                                               context.hypotheses)
-                assert hypfeatures_batch.size() == torch.Size([num_hyps, 2])
-                hypfeatures_batch_expanded = hypfeatures_batch.view(1, num_hyps, 2)\
-                                                             .expand(stem_width, -1, 2)\
-                                                             .contiguous()\
-                                                             .view(stem_width * num_hyps, 2)
-                hyp_arg_values = self.runHypModel(stem_idxs,
-                                                  encoded_goals, hyps_batch,
-                                                  hypfeatures_batch)
-                assert hyp_arg_values.size() == \
-                    torch.Size([1, stem_width, len(context.hypotheses)])
-                total_values = torch.cat((goal_arg_values, hyp_arg_values), dim=2)
-            else:
-                total_values = goal_arg_values
-            all_prob_batches = self._softmax((total_values +
-                                              stem_certainties.view(1, stem_width, 1)
-                                              .expand(-1, -1, num_probs))
-                                             .contiguous()
-                                             .view(1, stem_width * num_probs))\
-                                   .view(stem_width * num_probs)
+        encoded_goals_batch = self._model.goal_encoder(goals_batch)
 
-            final_probs, final_idxs = all_prob_batches.topk(beam_width)
-            assert not torch.isnan(final_probs).any()
-            assert final_probs.size() == torch.Size([beam_width])
-            row_length = self.training_args.max_length + len(context.hypotheses) + 1
-            stem_keys = final_idxs / row_length
-            assert stem_keys.size() == torch.Size([beam_width])
-            assert stem_idxs.size() == torch.Size([1, stem_width]), stem_idxs.size()
-            prediction_stem_idxs = stem_idxs.view(stem_width).index_select(0, stem_keys)
-            assert prediction_stem_idxs.size() == torch.Size([beam_width]), \
-                prediction_stem_idxs.size()
-            arg_idxs = final_idxs % row_length
-            assert arg_idxs.size() == torch.Size([beam_width])
-            return [Prediction(self.decodePrediction(context.goal,
-                                                     context.hypotheses,
-                                                     stem_idx.item(),
-                                                     arg_idx.item()),
-                               math.exp(prob))
-                    for stem_idx, arg_idx, prob in
-                    islice(zip(prediction_stem_idxs, arg_idxs, final_probs), k)]
+        stems_expanded_batch = torch.cat([stem_idxs.view(1, stem_width)
+                                          .expand(num_hyps, stem_width).contiguous()
+                                          .view(num_hyps * stem_width)
+                                          for stem_idxs, num_hyps, in zip(stem_idxs_batch, nhyps_batch)])
+        egoals_expanded_batch = torch.cat([encoded_goal.view(1, self.training_args.hidden_size)
+                                           .expand(num_hyps * stem_width, -1).contiguous()
+                                           for encoded_goal, num_hyps in zip(encoded_goals_batch,
+                                                                             nhyps_batch)])
+        tprems_expanded_batch = torch.cat([LongTensor(tpremises).view(1, -1, self.training_args.max_length)
+                                           .expand(stem_width, -1, -1).contiguous()
+                                           .view(-1, self.training_args.max_length)
+                                           for tpremises in tprems_batch])
+        pfeat_expanded_batch = torch.cat([FloatTensor(premise_features).view(1, num_hyps, 2)
+                                          .expand(stem_width, -1, -1).contiguous()
+                                          .view(num_hyps * stem_width, 2)
+                                          for premise_features, num_hyps in zip(pfeat_batch, nhyps_batch)])
+
+        prem_arg_values = self._model.hyp_model(stems_expanded_batch,
+                                                egoals_expanded_batch,
+                                                tprems_expanded_batch,
+                                                pfeat_expanded_batch)
+
+        prem_arg_values_split = prem_arg_values.split([num_hyps * stem_width for num_hyps in nhyps_batch])
+        total_values_list = [torch.cat((goal_values, prem_values.view(stem_width, -1)), dim=1) for
+                             goal_values, prem_values in zip(goal_arg_values, prem_arg_values_split)]
+        all_probs_list = [self._softmax((total_values +
+                                         stem_certainties.view(stem_width, 1)
+                                         .expand_as(total_values))
+                                        .contiguous()
+                                        .view(1, -1))
+                          .view(-1)
+                          for total_values, stem_certainties
+                          in zip(total_values_list, stem_certainties_batch)]
+
+        final_probs_list, final_idxs_list = zip(*[probs.topk(k) for probs in all_probs_list])
+        stem_keys_list = [final_idxs // (self.training_args.max_length + num_hyps + 1)
+                          for final_idxs, num_hyps in zip(final_idxs_list, nhyps_batch)]
+
+        stem_idxs_list = [stem_idxs.view(stem_width).index_select(0, stem_keys)
+                          for stem_idxs, stem_keys in zip(stem_idxs_batch, stem_keys_list)]
+
+        arg_idxs_list = [final_idxs % (self.training_args.max_length + num_hyps + 1)
+                         for final_idxs, num_hyps in zip(final_idxs_list, nhyps_batch)]
+
+        predictions = [[Prediction(decode_fpa_result(
+            extract_dataloader_args(self.training_args),
+            self._metadata,
+            context.hypotheses + context.relevant_lemmas,
+            context.goal,
+            stem_idx.item(),
+            arg_idx.item()),
+                            math.exp(prob))
+                 for stem_idx, arg_idx, prob in
+                 islice(zip(stem_idxs, arg_idxs, final_probs),
+                        min(k, 1 + num_hyps +
+                            len(get_fpa_words(context.goal))))]
+                for stem_idxs, arg_idxs, final_probs, context, num_hyps
+                in zip(stem_idxs_list, arg_idxs_list, final_probs_list,
+                       context_batch, nhyps_batch)]
+
+        for context, pred_list in zip(context_batch, predictions):
+            for batch_pred, single_pred in zip(pred_list,
+                                               self.predictKTactics(context, k)):
+                assert batch_pred.prediction == single_pred.prediction, \
+                    (batch_pred, single_pred)
+
+        return predictions
+
+    def predictKTactics(self, context: TacticContext, k: int) -> List[Prediction]:
+        assert self.training_args
+        assert self._model
+
+        num_stem_poss = get_num_tokens(self._metadata)
+        stem_width = min(self.training_args.max_beam_width, num_stem_poss,
+                         k ** 2)
+
+        tokenized_premises, hyp_features, \
+            nhyps_batch, tokenized_goal, \
+            goal_mask, \
+            word_features, vec_features = \
+                sample_fpa(extract_dataloader_args(self.training_args),
+                           self._metadata,
+                           context.relevant_lemmas,
+                           context.prev_tactics,
+                           context.hypotheses,
+                           context.goal)
+
+        num_hyps = nhyps_batch[0]
+
+        stem_distribution = self._model.stem_classifier(LongTensor(word_features),
+                                                        FloatTensor(vec_features))
+        stem_certainties, stem_idxs = stem_distribution.topk(stem_width)
+
+        goals_batch = LongTensor(tokenized_goal)
+        goal_arg_values = self._model.goal_args_model(
+            stem_idxs.view(1 * stem_width),
+            goals_batch.view(1, 1, self.training_args.max_length)
+            .expand(-1, stem_width, -1).contiguous()
+            .view(1 * stem_width,
+                  self.training_args.max_length))\
+                                     .view(1, stem_width,
+                                           self.training_args.max_length + 1)
+        goal_arg_values = torch.where(torch.ByteTensor(goal_mask)
+                                      .view(1, 1,
+                                            self.training_args.max_length + 1)
+                                      .expand(-1, stem_width, -1),
+                                      goal_arg_values,
+                                      torch.full_like(goal_arg_values,
+                                                      -float("Inf")))
+        assert goal_arg_values.size() == torch.Size([1, stem_width,
+                                                     self.training_args.max_length + 1]),\
+            "goal_arg_values.size(): {}; stem_width: {}".format(goal_arg_values.size(),
+                                                                stem_width)
+
+        num_probs = 1 + num_hyps + self.training_args.max_length
+        goal_symbols = get_fpa_words(context.goal)
+        num_valid_probs = (1 + num_hyps + len(goal_symbols)) * stem_width
+        if num_hyps > 0:
+            encoded_goals = self._model.goal_encoder(goals_batch)\
+                                       .view(1, 1, self.training_args.hidden_size)
+
+            hyps_batch = LongTensor(tokenized_premises)
+            assert hyps_batch.size() == torch.Size([1, num_hyps,
+                                                    self.training_args.max_length]), \
+                                                    (hyps_batch.size(),
+                                                     num_hyps,
+                                                     self.training_args.max_length)
+            hypfeatures_batch = FloatTensor(hyp_features)
+            assert hypfeatures_batch.size() == \
+                torch.Size([1, num_hyps, hypFeaturesSize()]), \
+                (hypfeatures_batch.size(), num_hyps, hypFeaturesSize())
+            hyp_arg_values = self.runHypModel(stem_idxs,
+                                              encoded_goals, hyps_batch,
+                                              hypfeatures_batch)
+            assert hyp_arg_values.size() == \
+                torch.Size([1, stem_width, num_hyps])
+            total_values = torch.cat((goal_arg_values, hyp_arg_values), dim=2)
+        else:
+            total_values = goal_arg_values
+        all_prob_batches = self._softmax((total_values +
+                                          stem_certainties.view(1, stem_width, 1)
+                                          .expand(-1, -1, num_probs))
+                                         .contiguous()
+                                         .view(1, stem_width * num_probs))\
+                               .view(stem_width * num_probs)
+
+        final_probs, final_idxs = all_prob_batches.topk(k)
+        assert not torch.isnan(final_probs).any()
+        assert final_probs.size() == torch.Size([k])
+        row_length = self.training_args.max_length + num_hyps + 1
+        stem_keys = final_idxs // row_length
+        assert stem_keys.size() == torch.Size([k])
+        assert stem_idxs.size() == torch.Size([1, stem_width]), stem_idxs.size()
+        prediction_stem_idxs = stem_idxs.view(stem_width).index_select(0, stem_keys)
+        assert prediction_stem_idxs.size() == torch.Size([k]), \
+            prediction_stem_idxs.size()
+        arg_idxs = final_idxs % row_length
+        assert arg_idxs.size() == torch.Size([k])
+
+        if self.training_args.lemma_args:
+            all_hyps = context.hypotheses + context.relevant_lemmas
+        else:
+            all_hyps = context.hypotheses
+        return [Prediction(decode_fpa_result(
+            extract_dataloader_args(self.training_args),
+            self._metadata,
+            all_hyps,
+            context.goal,
+            stem_idx.item(),
+            arg_idx.item()),
+                            math.exp(prob))
+                for stem_idx, arg_idx, prob in
+                islice(zip(prediction_stem_idxs, arg_idxs, final_probs), min(k, num_valid_probs))]
     def predictKTacticsWithLoss(self, in_data : TacticContext, k : int, correct : str) -> \
         Tuple[List[Prediction], float]:
         return self.predictKTactics(in_data, k), 0
@@ -300,64 +523,6 @@ class FeaturesPolyargPredictor(
         predictions = [subresult[0] for subresult in subresults]
         return predictions, loss
 
-    def predictTactic(self, context : TacticContext) -> Prediction:
-        assert self.training_args
-        assert self._model
-
-        word_features, vec_features = self.encodeFeatureVecs([context])
-        goals_batch = LongTensor([self.encodeStrTerm(context.goal)])
-        stem_distribution = self._model.stem_classifier(word_features, vec_features)
-        stem_certainties, stem_idxs = stem_distribution.topk(1)
-        goal_arg_values = self._model.goal_args_model(stem_idxs, goals_batch)
-        goal_symbols = tokenizer.get_symbols(context.goal)
-        for i in range(len(goal_symbols) + 1, goal_arg_values.size()[1]):
-            goal_arg_values[0, i] = -float("Inf")
-        encoded_goals = self._model.goal_encoder(goals_batch)
-        if len(context.hypotheses) > 0:
-            hyps_batch = LongTensor([[self.encodeStrTerm(hyp)
-                                      for hyp in context.hypotheses]])
-            hypfeatures_batch = self.encodeHypsFeatureVecs(context.goal,
-                                                           context.hypotheses)
-            hyp_arg_values = self.runHypModel(stem_idxs, encoded_goals, hyps_batch,
-                                              hypfeatures_batch)\
-                                 .view(1, len(context.hypotheses))
-            total_arg_values = torch.cat((goal_arg_values, hyp_arg_values),
-                                         dim=1)
-        else:
-            total_arg_values = goal_arg_values
-
-        total_arg_distribution = self._softmax(total_arg_values)
-        total_arg_certainties, total_arg_idxs = total_arg_distribution.topk(1)
-        probability = math.exp(stem_certainties[0] +
-                               total_arg_certainties[0])
-        return Prediction(self.decodePrediction(context.goal,
-                                                context.hypotheses,
-                                                stem_idxs[0].item(),
-                                                total_arg_idxs[0].item()),
-                          probability)
-    def encodeFeatureVecs(self, contexts : List[TacticContext])\
-        -> Tuple[torch.LongTensor, torch.FloatTensor]:
-        assert self._word_feature_functions
-        assert self._vec_feature_functions
-        word_features = LongTensor([[feature(c) for feature in
-                                     self._word_feature_functions]
-                                    for c in contexts])
-        vec_features = FloatTensor([[feature_val for feature in
-                                    self._vec_feature_functions
-                                    for feature_val in feature(c)]
-                                    for c in contexts])
-        return word_features, vec_features
-    def encodeHypsFeatureVecs(self, goal : str, hyps : List[str]) -> torch.FloatTensor:
-        return torch.FloatTensor([
-            [SequenceMatcher(None, goal,
-                             serapi_instance.get_hyp_type(hyp)).ratio(),
-             len(hyp)] for hyp in hyps])
-    def encodeStrTerm(self, term : str) -> List[int]:
-        assert self._tokenizer
-        assert self.training_args
-        return normalizeSentenceLength(
-            self._tokenizer.toTokenList(term),
-            self.training_args.max_length)
     def runHypModel(self, stem_idxs : torch.LongTensor, encoded_goals : torch.FloatTensor,
                     hyps_batch : torch.LongTensor, hypfeatures_batch : torch.FloatTensor):
         assert self._model
@@ -366,7 +531,7 @@ class FeaturesPolyargPredictor(
         assert batch_size == 1
         num_hyps = hyps_batch.size()[1]
         beam_width = stem_idxs.size()[1]
-        features_size = hypfeatures_batch.size()[1]
+        features_size = hypfeatures_batch.size()[2]
         hyp_arg_values = \
             self._model.hyp_model(stem_idxs.view(batch_size, beam_width, 1)
                                   .expand(-1, -1, num_hyps).contiguous()
@@ -389,19 +554,6 @@ class FeaturesPolyargPredictor(
                                         features_size))\
                                   .view(batch_size, beam_width, num_hyps)
         return hyp_arg_values
-    def decodePrediction(self, goal : str, hyps : List[str], stem_idx : int,
-                         total_arg_idx : int):
-        assert self._embedding
-        assert self.training_args
-        stem = self._embedding.decode_token(stem_idx)
-        max_goal_symbols = self.training_args.max_length
-        if total_arg_idx == 0:
-            return stem + "."
-        elif total_arg_idx - 1 < max_goal_symbols:
-            return stem + " " + tokenizer.get_symbols(goal)[total_arg_idx - 1] + "."
-        else:
-            return stem + " " + serapi_instance.get_var_term_in_hyp(
-                hyps[total_arg_idx - 1 - max_goal_symbols]) + "."
 
     def getOptions(self) -> List[Tuple[str, str]]:
         assert self.training_args
@@ -413,140 +565,144 @@ class FeaturesPolyargPredictor(
              ("predictor", "polyarg")]
     def _description(self) -> str:
         return "A predictor combining the goal token args and hypothesis args models."
+    def shortname(self) -> str:
+        return "polyarg"
     def add_args_to_parser(self, parser : argparse.ArgumentParser,
                            default_values : Dict[str, Any] = {}) -> None:
-        new_defaults = {"batch-size":64, "learning-rate":0.1,**default_values}
+        new_defaults = {"batch-size":128, "learning-rate":0.4, "epoch-step":3,
+                        **default_values}
         super().add_args_to_parser(parser, new_defaults)
         add_nn_args(parser, new_defaults)
         add_tokenizer_args(parser, new_defaults)
+        feature_set : Set[str] = set()
+        all_constructors : List[Type[Feature]] = vec_feature_constructors + word_feature_constructors # type: ignore
+        for feature_constructor in all_constructors:
+            new_args = feature_constructor\
+                .add_feature_arguments(parser, feature_set, default_values)
+            feature_set = feature_set.union(new_args)
         parser.add_argument("--max-length", dest="max_length", type=int,
-                            default=default_values.get("max-length", 120))
-        parser.add_argument("--num-head-keywords", dest="num_head_keywords", type=int,
-                            default=default_values.get("num-head-keywords", 100))
-        parser.add_argument("--num-tactic-keywords", dest="num_tactic_keywords", type=int,
-                            default=default_values.get("num-tactic-keywords", 50))
+                            default=default_values.get("max-length", 30))
+        parser.add_argument("--max-string-distance", type=int,
+                            default=default_values.get("max-string-distance", 50))
         parser.add_argument("--max-beam-width", dest="max_beam_width", type=int,
-                            default=default_values.get("max-beam-width", 5))
-    def _preprocess_data(self, data : RawDataset, arg_values : Namespace) \
-        -> Iterable[ScrapedTactic]:
-        data_iter = super()._preprocess_data(data, arg_values)
-        yield from map(serapi_instance.normalizeNumericArgs, data_iter)
+                            default=default_values.get("max-beam-width", 10))
+        parser.add_argument("--no-lemma-args", dest="lemma_args", action='store_false')
+        parser.add_argument("--no-hyp-features", dest="hyp_features", action="store_false")
+        parser.add_argument("--no-features", dest="features", action="store_false")
+        parser.add_argument("--no-hyp-rnn", dest="hyp_rnn", action="store_false")
+        parser.add_argument("--no-goal-rnn", dest="goal_rnn", action="store_false")
+        parser.add_argument("--replace-rnns-with-dnns", action="store_true")
+        parser.add_argument("--print-tensors", action="store_true")
+        parser.add_argument("--load-embedding", default=None)
+        parser.add_argument("--load-text-tokens", default=None)
+        parser.add_argument("--load-features", default=None)
+        parser.add_argument("--load-tensors", default=None)
+
+        parser.add_argument("--save-embedding", type=str, default=None)
+        parser.add_argument("--save-features-state", type=str, default=None)
+        parser.add_argument("--load-embedding", type=str, default=None)
+        parser.add_argument("--load-features-state", type=str, default=None)
 
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[FeaturesPolyArgDataset, Tuple[Tokenizer, Embedding,
                                                List[WordFeature], List[VecFeature]]]:
-        preprocessed_data = list(self._preprocess_data(data, arg_values))
-        stripped_data = [strip_scraped_output(dat) for dat in preprocessed_data]
-        self._word_feature_functions  = [feature_constructor(stripped_data, arg_values) for # type: ignore
-                                       feature_constructor in
-                                        word_feature_constructors]
-        self._vec_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
-                                       feature_constructor in vec_feature_constructors]
-        embedding, embedded_data = embed_data(RawDataset(preprocessed_data))
-        tokenizer, tokenized_goals = tokenize_goals(embedded_data, arg_values)
-        with multiprocessing.Pool(arg_values.num_threads) as pool:
-            start = time.time()
-            print("Creating dataset...", end="")
-            sys.stdout.flush()
-            result_data = FeaturesPolyArgDataset(list(pool.imap(
-                functools.partial(mkFPASample, embedding,
-                                  tokenizer,
-                                  arg_values.max_length,
-                                  self._word_feature_functions,
-                                  self._vec_feature_functions),
-                zip(preprocessed_data, tokenized_goals))))
-            print("{:.2f}s".format(time.time() - start))
-        return result_data, (tokenizer, embedding, self._word_feature_functions,
-                             self._vec_feature_functions)
-    def _optimize_model_to_disc(self,
-                                encoded_data : FeaturesPolyArgDataset,
-                                metadata : Tuple[Tokenizer, Embedding,
-                                                 List[WordFeature], List[VecFeature]],
-                                arg_values : Namespace) \
-        -> None:
-        tokenizer, embedding, word_features, vec_features = metadata
-        save_checkpoints("polyarg",
-                         metadata, arg_values,
-                         self._optimize_checkpoints(encoded_data, arg_values,
-                                                    tokenizer, embedding))
-    def _optimize_checkpoints(self, encoded_data : FeaturesPolyArgDataset,
-                              arg_values : Namespace,
-                              tokenizer : Tokenizer,
-                              embedding : Embedding) \
-        -> Iterable[NeuralPredictorState]:
-        return optimize_checkpoints(self._data_tensors(encoded_data, arg_values),
-                                    arg_values,
-                                    self._get_model(arg_values, embedding.num_tokens(),
-                                                    tokenizer.numTokens()),
-                                    lambda batch_tensors, model:
-                                    self._getBatchPredictionLoss(arg_values,
-                                                                 batch_tensors,
-                                                                 model))
+        pass
+    def _optimize_model(self, arg_values : Namespace) -> Iterable[FeaturesPolyargState]:
+        with print_time("Loading data", guard=arg_values.verbose):
+            if arg_values.start_from:
+                _, (old_arg_values, unparsed_args,
+                    metadata, state) = torch.load(arg_values.start_from)
+                _, data_lists, \
+                    (word_features_size, vec_features_size) = \
+                    features_polyarg_tensors_with_meta(
+                        extract_dataloader_args(arg_values),
+                        str(arg_values.scrape_file),
+                        metadata)
+            else:
+                metadata, data_lists, \
+                    (word_features_size, vec_features_size) = \
+                    features_polyarg_tensors(
+                        extract_dataloader_args(arg_values),
+                        str(arg_values.scrape_file))
+        with print_time("Converting data to tensors", guard=arg_values.verbose):
+            unpadded_tokenized_hyp_types, \
+                unpadded_hyp_features, \
+                num_hyps, \
+                tokenized_goals, \
+                goal_masks, \
+                word_features, \
+                vec_features, \
+                tactic_stem_indices, \
+                arg_indices = data_lists
+
+            tensors = [pad_sequence([torch.LongTensor(tokenized_hyps_list)
+                                     for tokenized_hyps_list
+                                     in unpadded_tokenized_hyp_types],
+                                    batch_first=True),
+                       pad_sequence([torch.FloatTensor(hyp_features_vec)
+                                     for hyp_features_vec
+                                     in unpadded_hyp_features],
+                                    batch_first=True),
+                       torch.LongTensor(num_hyps),
+                       torch.LongTensor(tokenized_goals),
+                       torch.ByteTensor(goal_masks),
+                       torch.LongTensor(word_features),
+                       torch.FloatTensor(vec_features),
+                       torch.LongTensor(tactic_stem_indices),
+                       torch.LongTensor(arg_indices)]
+            with open("tensors.pickle", 'wb') as f:
+                torch.save(tensors, f)
+            eprint(tensors, guard=arg_values.print_tensors)
+
+        with print_time("Building the model", guard=arg_values.verbose):
+
+            if arg_values.start_from:
+                self.load_saved_state(arg_values, unparsed_args,
+                                      metadata, state)
+                model = self._model
+                epoch_start = self.num_epochs
+            else:
+                model = self._get_model(arg_values,
+                                        word_features_size,
+                                        vec_features_size,
+                                        get_num_indices(metadata),
+                                        get_num_tokens(metadata))
+                epoch_start = 1
+
+        assert model
+        assert epoch_start
+        return ((metadata, state) for state in optimize_checkpoints(tensors, arg_values, model,
+                                                                    lambda batch_tensors, model:
+                                                                    self._getBatchPredictionLoss(arg_values,
+                                                                                                 batch_tensors,
+                                                                                                 model), epoch_start))
+
     def load_saved_state(self,
                          args : Namespace,
-                         metadata : Tuple[Tokenizer, Embedding,
-                                          List[WordFeature], List[VecFeature]],
+                         unparsed_args : List[str],
+                         metadata : Any,
                          state : NeuralPredictorState) -> None:
-        self._tokenizer, self._embedding, \
-            self._word_feature_functions, self._vec_feature_functions= \
-                metadata
         model = maybe_cuda(self._get_model(args,
-                                           self._embedding.num_tokens(),
-                                           self._tokenizer.numTokens()))
+                                           get_word_feature_vocab_sizes(metadata),
+                                           get_vec_features_size(metadata),
+                                           get_num_indices(metadata),
+                                           get_num_tokens(metadata)))
         model.load_state_dict(state.weights)
         self._model = model
         self.training_loss = state.loss
         self.num_epochs = state.epoch
         self.training_args = args
-    def _data_tensors(self, encoded_data : FeaturesPolyArgDataset,
-                      arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        tokenized_hyp_types, hyp_features, tokenized_goals, \
-            word_features, vec_features, tactic_stems, \
-            arg_types, args = zip(*sorted(encoded_data,
-                                          key=lambda s: len(s.tokenized_hyp_types),
-                                          reverse=True))
-        padded_hyps = pad_sequence([torch.LongTensor(tokenized_hyps_list)
-                                    for tokenized_hyps_list
-                                    in tokenized_hyp_types],
-                                   batch_first=True)
-        padded_hyp_features = pad_sequence([torch.FloatTensor(hyp_features_list)
-                                            for hyp_features_list
-                                            in hyp_features],
-                                           batch_first=True)
-        for arg, arg_type, hlist in zip(args, arg_types, tokenized_hyp_types):
-            if arg_type == ArgType.GOAL_TOKEN:
-                assert arg.token_idx < arg_values.max_length
-            elif arg_type == ArgType.HYP_ID:
-                assert arg.hyp_idx < len(hlist)
-        result = [padded_hyps,
-                  padded_hyp_features,
-                  torch.LongTensor([len(tokenized_hyp_type_list)
-                                    for tokenized_hyp_type_list
-                                    in tokenized_hyp_types]),
-                  torch.LongTensor(tokenized_goals),
-                  torch.LongTensor(word_features),
-                  torch.FloatTensor(vec_features),
-                  torch.LongTensor(tactic_stems),
-                  torch.LongTensor([
-                      0 if arg_type == ArgType.NO_ARG else
-                      (arg.token_idx + 1) if arg_type == ArgType.GOAL_TOKEN else
-                      (arg.hyp_idx + arg_values.max_length + 1)
-                      for arg_type, arg in zip(arg_types, args)])]
-        return result
+        self.unparsed_args = unparsed_args
+        self._metadata = metadata
+
     def _get_model(self, arg_values : Namespace,
+                   wordf_sizes : List[int],
+                   vecf_size : int,
                    stem_vocab_size : int,
                    goal_vocab_size : int) \
         -> FeaturesPolyArgModel:
-        assert self._word_feature_functions
-        assert self._vec_feature_functions
-        feature_vec_size = sum([feature.feature_size()
-                                for feature in self._vec_feature_functions])
-        word_feature_vocab_sizes = [feature.vocab_size()
-                                    for feature in self._word_feature_functions]
         return FeaturesPolyArgModel(
-            FeaturesClassifier(self._word_feature_functions,
-                               self._vec_feature_functions,
+            FeaturesClassifier(wordf_sizes, vecf_size,
                                arg_values.hidden_size,
                                arg_values.num_layers,
                                stem_vocab_size),
@@ -554,16 +710,16 @@ class FeaturesPolyargPredictor(
                               arg_values.hidden_size),
             EncoderRNN(goal_vocab_size, arg_values.hidden_size, arg_values.hidden_size),
             HypArgModel(arg_values.hidden_size, stem_vocab_size, goal_vocab_size,
-                        2, arg_values.hidden_size))
+                        hypFeaturesSize(), arg_values.hidden_size))
     def _getBatchPredictionLoss(self, arg_values : Namespace,
-                                data_batch : Sequence[torch.Tensor],
+                                batch : Sequence[torch.Tensor],
                                 model : FeaturesPolyArgModel) -> torch.FloatTensor:
         tokenized_hyp_types_batch, hyp_features_batch, num_hyps_batch, \
-            tokenized_goals_batch, \
+            tokenized_goals_batch, goal_masks_batch, \
             word_features_batch, vec_features_batch, \
             stem_idxs_batch, arg_total_idxs_batch = \
                 cast(Tuple[torch.LongTensor, torch.FloatTensor, torch.LongTensor,
-                           torch.LongTensor,
+                           torch.LongTensor, torch.ByteTensor,
                            torch.LongTensor, torch.FloatTensor,
                            torch.LongTensor, torch.LongTensor],
                      data_batch)
@@ -580,19 +736,32 @@ class FeaturesPolyargPredictor(
                 mergedStemIdxs.append(predictedStemIdxList)
             else:
                 mergedStemIdxs.append(
-                    torch.cat((stem_idx.view(1).cuda(),
+                    torch.cat((maybe_cuda(stem_idx.view(1)),
                                predictedStemIdxList[:stem_width-1])))
         mergedStemIdxsT = torch.stack(mergedStemIdxs)
         correctPredictionIdxs = torch.LongTensor([list(idxList).index(stem_idx) for
                                                   idxList, stem_idx
                                                   in zip(mergedStemIdxs, stem_var)])
-        tokenized_hyps_var = maybe_cuda(Variable(tokenized_hyp_types_batch))
-        hyp_features_var = maybe_cuda(Variable(hyp_features_batch))
+        if arg_values.hyp_rnn:
+            tokenized_hyps_var = maybe_cuda(Variable(tokenized_hyp_types_batch))
+        else:
+            tokenized_hyps_var = maybe_cuda(Variable(torch.zeros_like(tokenized_hyp_types_batch)))
+
+        if arg_values.hyp_features:
+            hyp_features_var = maybe_cuda(Variable(hyp_features_batch))
+        else:
+            hyp_features_var = maybe_cuda(Variable(torch.zeros_like(hyp_features_batch)))
+
         goal_arg_values = model.goal_args_model(
             mergedStemIdxsT.view(batch_size * stem_width),
             tokenized_goals_batch.view(batch_size, 1, goal_size).expand(-1, stem_width, -1)
             .contiguous().view(batch_size * stem_width, goal_size))\
             .view(batch_size, stem_width, goal_size + 1)
+        goal_arg_values = torch.where(
+            maybe_cuda(goal_masks_batch.view(batch_size, 1, arg_values.max_length + 1))
+            .expand(-1, stem_width, -1),
+            goal_arg_values,
+            maybe_cuda(torch.full_like(goal_arg_values, -float("Inf"))))
         encoded_goals = model.goal_encoder(tokenized_goals_batch)
 
         hyp_lists_length = tokenized_hyp_types_batch.size()[1]
@@ -604,6 +773,8 @@ class FeaturesPolyargPredictor(
             encoded_goals.view(batch_size, 1, 1, encoded_goal_size)\
             .expand(-1, stem_width, hyp_lists_length, -1).contiguous()\
             .view(batch_size * stem_width * hyp_lists_length, encoded_goal_size)
+        if not arg_values.goal_rnn:
+            encoded_goals_expanded = torch.zeros_like(encoded_goals_expanded)
         stems_expanded = \
             mergedStemIdxsT.view(batch_size, stem_width, 1)\
             .expand(-1, -1, hyp_lists_length).contiguous()\
@@ -637,65 +808,35 @@ class FeaturesPolyargPredictor(
         loss += self._criterion(total_arg_distribution, total_arg_var)
         return loss
 
-def mkFPASample(embedding : Embedding,
-                mytokenizer : Tokenizer,
-                max_length : int,
-                word_feature_functions : List[WordFeature],
-                vec_feature_functions : List[VecFeature],
-                zipped : Tuple[ScrapedTactic, List[int]]) \
-                -> FeaturesPolyArgSample:
-    inter, tokenized_goal = zipped
-    prev_tactics, hypotheses, goal_str, tactic = inter
-    context = strip_scraped_output(inter)
-    word_features = [feature(context) for feature in word_feature_functions]
-    vec_features = [feature_val for feature in vec_feature_functions
-                    for feature_val in feature(context)]
-    tokenized_hyp_types = [normalizeSentenceLength(
-        mytokenizer.toTokenList(serapi_instance.get_hyp_type(hyp)),
-        max_length)
-                           for hyp in hypotheses]
-    hypfeatures = [[SequenceMatcher(None, goal_str,
-                                    serapi_instance.get_hyp_type(hyp)).ratio(),
-                    len(hyp)] for hyp in hypotheses]
-    tactic_stem, tactic_argstr = serapi_instance.split_tactic(tactic)
-    stem_idx = embedding.encode_token(tactic_stem)
-    argstr_tokens = tactic_argstr.strip(".").split()
-    assert len(argstr_tokens) < 2, \
-        "Tactic {} doesn't fit our argument model! Too many tokens" .format(tactic)
-    arg : TacticArg
-    if len(argstr_tokens) == 0:
-        arg_type = ArgType.NO_ARG
-        arg = None
-    else:
-        goal_symbols = tokenizer.get_symbols(goal_str)[:max_length]
-        arg_token = argstr_tokens[0]
-        if arg_token in goal_symbols:
-            arg_type = ArgType.GOAL_TOKEN
-            arg_idx = goal_symbols.index(arg_token)
-            assert arg_idx < max_length, "Tactic {} doesn't fit our argument model! "\
-                "Token {} is not a hyp var or goal token.\n"\
-                "Hyps: {}\n"\
-                "Goal: {}".format(tactic, arg_token, hypotheses, goal_str)
-            arg = GoalTokenArg(goal_symbols.index(arg_token))
-        else:
-            indexed_hyp_vars = serapi_instance.get_indexed_vars_in_hyps(hypotheses)
-            hyp_vars = [hyp_var for hyp_var, idx in indexed_hyp_vars]
-            assert arg_token in hyp_vars, "Tactic {} doesn't fit our argument model! "\
-                "Token {} is not a hyp var or goal token.\n"\
-                "Hyps: {}\n"\
-                "Goal: {}".format(tactic, arg_token, hypotheses, goal_str)
-            arg_type = ArgType.HYP_ID
-            arg = HypIdArg(dict(indexed_hyp_vars)[arg_token])
-    return FeaturesPolyArgSample(
-        tokenized_hyp_types,
-        hypfeatures,
-        normalizeSentenceLength(tokenized_goal, max_length),
-        word_features,
-        vec_features,
-        stem_idx,
-        arg_type,
-        arg)
+def hypFeaturesSize() -> int:
+    return 2
 
-def main(arg_list : List[str]) -> None:
+
+def extract_dataloader_args(args: argparse.Namespace) -> DataloaderArgs:
+    dargs = DataloaderArgs()
+    # dargs.max_distance = args.max_distance
+    dargs.max_length = args.max_length
+    dargs.num_keywords = args.num_keywords
+    dargs.max_string_distance = args.max_string_distance
+    dargs.max_premises = args.max_premises
+    dargs.num_relevance_samples = args.num_relevance_samples
+    assert args.load_tokens, \
+        "Must have a keywords file for the rust dataloader"
+    dargs.keywords_file = args.load_tokens
+    dargs.context_filter = args.context_filter
+    dargs.save_embedding = args.save_embedding
+    dargs.save_features_state = args.save_features_state
+    dargs.load_embedding = args.load_embedding
+    dargs.load_features_state = args.load_features_state
+    return dargs
+
+
+def context_py2r(py_context: TacticContext) -> dataloader.TacticContext:
+    return dataloader.TacticContext(
+        py_context.relevant_lemmas, py_context.prev_tactics,
+        dataloader.Obligation(py_context.hypotheses, py_context.goal))
+
+
+def main(arg_list: List[str]) -> None:
     predictor = FeaturesPolyargPredictor()
     predictor.train(arg_list)

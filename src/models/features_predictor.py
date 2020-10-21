@@ -19,15 +19,16 @@
 #
 ##########################################################################
 from models.tactic_predictor import \
-    (NeuralPredictorState, TrainablePredictor, TacticContext,
+    (NeuralPredictorState, TrainablePredictor,
      Prediction, save_checkpoints, optimize_checkpoints, embed_data,
      predictKTactics, predictKTacticsWithLoss,
-     predictKTacticsWithLoss_batch, strip_scraped_output)
+     predictKTacticsWithLoss_batch)
 from models.components import (Embedding, SimpleEmbedding, add_nn_args)
 from data import (Sentence, ListDataset, RawDataset,
                   normalizeSentenceLength)
 from serapi_instance import get_stem
 from util import *
+from format import TacticContext, strip_scraped_output
 
 import torch
 import torch.nn as nn
@@ -137,13 +138,12 @@ class FeaturesPredictor(TrainablePredictor[FeaturesDataset,
                             default=default_values.get("word_embedding_size", 10))
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[FeaturesDataset, Tuple[Embedding, List[VecFeature], List[WordFeature]]]:
-        preprocessed_data = list(self._preprocess_data(data, arg_values))
-        stripped_data = [strip_scraped_output(dat) for dat in preprocessed_data]
+        stripped_data = [strip_scraped_output(dat) for dat in data]
         self._vec_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
                                        feature_constructor in vec_feature_constructors]
         self._word_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
-                                       feature_constructor in word_feature_constructors]
-        embedding, embedded_data = embed_data(RawDataset(preprocessed_data))
+                                        feature_constructor in word_feature_constructors]
+        embedding, embedded_data = embed_data(data)
         return (FeaturesDataset([
             FeaturesSample(self._get_vec_features(strip_scraped_output(scraped)),
                            self._get_word_features(strip_scraped_output(scraped)),
@@ -172,6 +172,7 @@ class FeaturesPredictor(TrainablePredictor[FeaturesDataset,
         return "A predictor using only hand-engineered features"
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : Tuple[Embedding, List[VecFeature], List[WordFeature]],
                          state : NeuralPredictorState) -> None:
         self._embedding, self._vec_feature_functions, self._word_feature_functions = metadata
@@ -180,12 +181,20 @@ class FeaturesPredictor(TrainablePredictor[FeaturesDataset,
         self.training_loss = state.loss
         self.num_epochs = state.epoch
         self.training_args = args
-    def _data_tensors(self, encoded_data : FeaturesDataset,
-                      arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        vec_features, word_features, tactics = zip(*encoded_data)
-        return [torch.FloatTensor(vec_features), torch.LongTensor(word_features),
+        self.unparsed_args = unparsed_args
+
+    def _data_tensors(self, encoded_data: FeaturesDataset,
+                      arg_values: Namespace) \
+            -> List[torch.Tensor]:
+        vec_features, word_features, tactics = \
+            cast(Tuple[List[List[float]],
+                       List[List[int]],
+                       List[int]],
+                 zip(*encoded_data))
+        return [torch.FloatTensor(vec_features),
+                torch.LongTensor(word_features),
                 torch.LongTensor(tactics)]
+
     def _get_model(self, arg_values : Namespace, tactic_vocab_size : int) \
         -> FeaturesClassifier:
         assert self._vec_feature_functions

@@ -19,24 +19,44 @@
 #
 ##########################################################################
 
-from models.tactic_predictor import TacticContext
+from format import TacticContext
 from tokenizer import get_symbols, limitNumTokens
-from util import *
+from util import eprint
 import serapi_instance
 
 import typing
-from typing import List
+from typing import List, Dict, Set, Any, overload, Tuple
 from abc import ABCMeta, abstractmethod
 from collections import Counter
 from difflib import SequenceMatcher
+from pathlib_revised import Path2
 import re
 import argparse
 import math
+import torch
+import json
 
 class Feature(metaclass=ABCMeta):
     def __init__(self, init_dataset : List[TacticContext],
                  args : argparse.Namespace) -> None:
         pass
+    @staticmethod
+    def add_feature_arguments(parser : argparse.ArgumentParser,
+                              feature_args_set : Set[str],
+                              default_values : Dict[str, Any] = {}) -> Set[str]:
+        return set()
+        pass
+
+
+def maybe_add_argument(parser: argparse.ArgumentParser,
+                       default_values: Dict[str, Any],
+                       name: str, t: type,
+                       default_value: Any,
+                       feature_args_set: Set[str]) -> None:
+    if name not in feature_args_set:
+        parser.add_argument(f"--{name}", type=t,
+                            default=default_values.get(name, default_value))
+
 class VecFeature(Feature, metaclass=ABCMeta):
     @abstractmethod
     def __call__(self, context : TacticContext) -> List[float]:
@@ -80,11 +100,16 @@ class TopLevelTokenInGoalV(VecFeature):
     def __init__(self, init_dataset : List[TacticContext],
                  args : argparse.Namespace) -> None:
         headTokenCounts : typing.Counter[str] = Counter()
-        for prev_tactics, hyps, goal in init_dataset:
+        for relevant_lemmas, prev_tactics, hyps, goal in init_dataset:
             headToken = get_symbols(goal)[0]
             headTokenCounts[headToken] += 1
-        self.headKeywords = [word for word, count in
-                             headTokenCounts.most_common(args.num_head_keywords)]
+        if args.load_head_keywords and Path2(args.load_head_keywords).exists():
+            self.headKeywords = torch.load(args.load_head_keywords)
+        else:
+            self.headKeywords = [word for word, count in
+                                 headTokenCounts.most_common(args.num_head_keywords)]
+        if args.save_head_keywords:
+            torch.save(self.headKeywords, args.save_head_keywords)
         eprint("Head keywords are {}".format(self.headKeywords),
                guard=args.print_keywords)
     def __call__(self, context : TacticContext) -> List[float]:
@@ -95,40 +120,97 @@ class TopLevelTokenInGoalV(VecFeature):
         return oneHotHeads
     def feature_size(self) -> int:
         return len(self.headKeywords)
+    @staticmethod
+    def add_feature_arguments(parser : argparse.ArgumentParser,
+                              feature_args_set : Set[str],
+                              default_values : Dict[str, Any] = {}) -> Set[str]:
+        maybe_add_argument(parser, default_values, "num-head-keywords", int,
+                           100, feature_args_set)
+        maybe_add_argument(parser, default_values, "save-head-keywords", str,
+                           "data/head-keywords.dat", feature_args_set)
+        maybe_add_argument(parser, default_values, "load-head-keywords", str,
+                           "data/head-keywords.dat", feature_args_set)
+        return {"num-head-keywords", "save-head-keywords", "load-head-keywords"}
+        pass
+
+
 class TopLevelTokenInGoal(WordFeature):
-    def __init__(self, init_dataset : List[TacticContext],
-                 args : argparse.Namespace) -> None:
-        headTokenCounts : typing.Counter[str] = Counter()
-        for prev_tactics, hyps, goal in init_dataset:
+    @staticmethod
+    def from_data(init_dataset: List[TacticContext],
+                  args: argparse.Namespace) -> 'TopLevelTokenInGoal':
+        headTokenCounts: typing.Counter[str] = Counter()
+        for relevant_lemmas, prev_tactics, hyps, goal in init_dataset:
+            if goal.strip() == "":
+                continue
             headToken = get_symbols(goal)[0]
             headTokenCounts[headToken] += 1
-        self.headKeywords = [word for word, count in
-                             headTokenCounts.most_common(args.num_head_keywords)]
-        eprint("Goal head keywords are {}".format(self.headKeywords),
+        if args.load_head_keywords and Path2(args.load_head_keywords).exists():
+            result = TopLevelTokenInGoal(torch.load(args.load_head_keywords))
+        else:
+            result = TopLevelTokenInGoal(
+                [word for word, count in
+                 headTokenCounts.most_common(args.num_head_keywords)])
+        if args.save_head_keywords:
+            torch.save(result.headKeywords, args.save_head_keywords)
+        eprint("Goal head keywords are {}".format(result.headKeywords),
                guard=args.print_keywords)
-    def __call__(self, context : TacticContext) -> int:
+        return result
+
+    def __init__(self, head_keywords: List[str]) -> None:
+        self.headKeywords = head_keywords
+
+    def __call__(self, context: TacticContext) -> int:
+        if context.goal.strip() == "":
+            return 0
         headToken = get_symbols(context.goal)[0]
         if headToken in self.headKeywords:
-            return self.headKeywords.index(headToken) + 1
+            return self.headKeywords.index(headToken) + 2
         else:
-            return 0
+            return 1
+
     def vocab_size(self) -> int:
-        return len(self.headKeywords) + 1
+        return len(self.headKeywords) + 2
+
+    @staticmethod
+    def add_feature_arguments(parser : argparse.ArgumentParser,
+                              feature_args_set : Set[str],
+                              default_values : Dict[str, Any] = {}) -> Set[str]:
+        maybe_add_argument(parser, default_values, "num-head-keywords", int,
+                           100, feature_args_set)
+        maybe_add_argument(parser, default_values, "save-head-keywords", str,
+                           "data/head-keywords.dat", feature_args_set)
+        maybe_add_argument(parser, default_values, "load-head-keywords", str,
+                           "data/head-keywords.dat", feature_args_set)
+        return {"num-head-keywords", "save-head-keywords", "load-head-keywords"}
+        pass
+
 
 class TopLevelTokenInBestHyp(WordFeature):
-    def __init__(self, init_dataset : List[TacticContext],
-                 args : argparse.Namespace) -> None:
-        self.max_length = args.max_length
-        headTokenCounts : typing.Counter[str] = Counter()
-        for prev_tactics, hyps, goal in init_dataset:
+    @staticmethod
+    def from_data(init_dataset: List[TacticContext],
+                  args: argparse.Namespace) -> 'TopLevelTokenInBestHyp':
+        headTokenCounts: typing.Counter[str] = Counter()
+        for relevant_lemmas, prev_tactics, hyps, goal in init_dataset:
             for hyp in hyps:
                 headToken = get_symbols(serapi_instance.get_hyp_type(hyp))[0]
                 headTokenCounts[headToken] += 1
-        self.headKeywords = [word for word, count in
-                             headTokenCounts.most_common(args.num_head_keywords)]
-        eprint("Hypothesis head keywords are {}".format(self.headKeywords),
+        if args.load_head_keywords and Path2(args.load_head_keywords).exists():
+            result = TopLevelTokenInBestHyp(
+                args, torch.load(args.load_head_keywords))
+        else:
+            result = TopLevelTokenInBestHyp(
+                [word for word, count in
+                 headTokenCounts.most_common(args.num_head_keywords)])
+        eprint("Hypothesis head keywords are {}".format(result.headKeywords),
                guard=args.print_keywords)
-    def __call__(self, context : TacticContext) -> int:
+        return result
+
+    def __init__(self, args: argparse.Namespace, head_keywords: List[str]) \
+            -> None:
+        self.headKeywords = head_keywords
+        self.max_length = args.max_length
+
+    def __call__(self, context: TacticContext) -> int:
         if len(context.hypotheses) == 0:
             return 0
         hyp_types = [limitNumTokens(serapi_instance.get_hyp_type(hyp),
@@ -137,14 +219,29 @@ class TopLevelTokenInBestHyp(WordFeature):
         goal = limitNumTokens(context.goal, self.max_length)
         closest_hyp_type = max(hyp_types,
                                key=lambda x:
-                               SequenceMatcher(None, goal, x).ratio() * len(get_symbols(x)))
+                               SequenceMatcher(None, goal, x).ratio()
+                               * len(get_symbols(x)))
         headToken = get_symbols(closest_hyp_type)[0]
         if headToken in self.headKeywords:
             return self.headKeywords.index(headToken) + 1
         else:
             return 0
+
     def vocab_size(self) -> int:
         return len(self.headKeywords) + 1
+
+    @staticmethod
+    def add_feature_arguments(parser : argparse.ArgumentParser,
+                              feature_args_set : Set[str],
+                              default_values : Dict[str, Any] = {}) -> Set[str]:
+        maybe_add_argument(parser, default_values, "num-head-keywords", int,
+                           100, feature_args_set)
+        maybe_add_argument(parser, default_values, "save-head-keywords", str,
+                           "data/head-keywords.dat", feature_args_set)
+        maybe_add_argument(parser, default_values, "load-head-keywords", str,
+                           "data/head-keywords.dat", feature_args_set)
+        return {"num-head-keywords", "save-head-keywords", "load-head-keywords"}
+        pass
 
 class BestHypScore(VecFeature):
     def __init__(self, init_dataset : List[TacticContext],
@@ -155,7 +252,7 @@ class BestHypScore(VecFeature):
             return [0.]
         hyp_types = [serapi_instance.get_hyp_type(hyp)[:100] for hyp in context.hypotheses]
         best_hyp_score = max([SequenceMatcher(None, context.goal,hyp).ratio() * len(hyp)
-                        for hyp in hyp_types])
+                              for hyp in hyp_types])
         return [best_hyp_score / 100]
     def feature_size(self) -> int:
         return 1
@@ -164,12 +261,15 @@ class PrevTacticV(VecFeature):
     def __init__(self, init_dataset : List[TacticContext],
                  args : argparse.Namespace) -> None:
         prevTacticsCounts : typing.Counter[str] = Counter()
-        for prev_tactics, hyps, goal in init_dataset:
+        for relevant_lemmas, prev_tactics, hyps, goal in init_dataset:
             if len(prev_tactics) > 2:
                 prevTacticsCounts[serapi_instance.get_stem(prev_tactics[-1])] += 1
-        self.tacticKeywords = ["Proof"] + \
-            [word for word, count in
-             prevTacticsCounts.most_common(args.num_tactic_keywords)]
+        if args.load_tactic_keywords and Path2(args.load_tactic_keywords).exists():
+            self.tacticKeywords = torch.load(args.load_tactic_keywords)
+        else:
+            self.tacticKeywords = ["Proof"] + \
+                [word for word, count in
+                 prevTacticsCounts.most_common(args.num_tactic_keywords)]
         eprint("Tactic keywords are {}".format(self.tacticKeywords),
                guard=args.print_keywords)
     def __call__(self, context : TacticContext) -> List[float]:
@@ -181,18 +281,44 @@ class PrevTacticV(VecFeature):
         return oneHotPrevs
     def feature_size(self) -> int:
         return len(self.tacticKeywords)
+    @staticmethod
+    def add_feature_arguments(parser : argparse.ArgumentParser,
+                              feature_args_set : Set[str],
+                              default_values : Dict[str, Any] = {}) -> Set[str]:
+        maybe_add_argument(parser, default_values, "num-tactic-keywords", int,
+                           50, feature_args_set)
+        maybe_add_argument(parser, default_values, "save-tactic-keywords", str,
+                           "data/tactic-keywords.dat", feature_args_set)
+        maybe_add_argument(parser, default_values, "load-tactic-keywords", str,
+                           "data/tactic-keywords.dat", feature_args_set)
+        return {"num-tactic-keywords", "save-tactic-keywords", "load-tactic-keywords"}
+
+
 class PrevTactic(WordFeature):
-    def __init__(self, init_dataset : List[TacticContext],
-                 args : argparse.Namespace) -> None:
-        prevTacticsCounts : typing.Counter[str] = Counter()
-        for prev_tactics, hyps, goal in init_dataset:
+
+    @staticmethod
+    def from_data(init_dataset: List[TacticContext],
+                  args: argparse.Namespace) -> 'PrevTactic':
+        prevTacticsCounts: typing.Counter[str] = Counter()
+        for relevant_lemmas, prev_tactics, hyps, goal in init_dataset:
             if len(prev_tactics) > 2:
-                prevTacticsCounts[serapi_instance.get_stem(prev_tactics[-1])] += 1
-        self.tacticKeywords = ["Proof"] + \
-            [word for word, count in
-             prevTacticsCounts.most_common(args.num_tactic_keywords)]
-        eprint("Tactic keywords are {}".format(self.tacticKeywords),
+                prevTacticsCounts[
+                    serapi_instance.get_stem(prev_tactics[-1])] += 1
+        if args.load_tactic_keywords and \
+           Path2(args.load_tactic_keywords).exists():
+            result = PrevTactic(torch.load(args.load_tactic_keywords))
+        else:
+            result = PrevTactic(["Proof"] +
+                                [word for word, count in
+                                 prevTacticsCounts.most_common(
+                                     args.num_tactic_keywords)])
+        eprint("Tactic keywords are {}".format(result.tacticKeywords),
                guard=args.print_keywords)
+        return result
+
+    def __init__(self, tactic_keywords: List[str]) -> None:
+        self.tacticKeywords = tactic_keywords
+
     def __call__(self, context : TacticContext) -> int:
         prev_tactic = (serapi_instance.get_stem(context.prev_tactics[-1]) if
                        len(context.prev_tactics) > 1 else "Proof")
@@ -202,6 +328,18 @@ class PrevTactic(WordFeature):
             return 0
     def vocab_size(self) -> int:
         return len(self.tacticKeywords) + 1
+    @staticmethod
+    def add_feature_arguments(parser : argparse.ArgumentParser,
+                              feature_args_set : Set[str],
+                              default_values : Dict[str, Any] = {}) -> Set[str]:
+        maybe_add_argument(parser, default_values, "num-tactic-keywords", int,
+                           50, feature_args_set)
+        maybe_add_argument(parser, default_values, "save-tactic-keywords", str,
+                           "data/tactic-keywords.dat", feature_args_set)
+        maybe_add_argument(parser, default_values, "load-tactic-keywords", str,
+                           "data/tactic-keywords.dat", feature_args_set)
+        return {"num-tactic-keywords", "save-tactic-keywords", "load-tactic-keywords"}
+        pass
 
 class NumUnboundIdentifiersInGoal(VecFeature):
     def __call__(self, context : TacticContext) -> List[float]:
@@ -249,6 +387,22 @@ class HasFalseToken(VecFeature):
         return [float(bool(goalHasFalse)), float(bool(hypsHaveFalse))]
     def feature_size(self) -> int:
         return 2
+
+
+def load_features(args: argparse.Namespace, features_json_path: str) -> \
+      Tuple[List[WordFeature], List[VecFeature]]:
+    with open(features_json_path, 'r') as f:
+        features_state = json.load(f)
+
+    vec_features = [BestHypScore([], args)]
+    word_features = [
+        PrevTactic(features_state["tactics"]),
+        TopLevelTokenInGoal(features_state["goal_tokens"]),
+        TopLevelTokenInBestHyp(args, features_state["hyp_tokens"]),
+    ]
+
+    return word_features, vec_features
+
 
 vec_feature_constructors = [
     # HasFalseToken,

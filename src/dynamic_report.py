@@ -34,7 +34,6 @@ from pathlib_revised import Path2
 from typing import List, Any, Tuple, Dict, Union, cast, NewType, Callable
 
 from shutil import *
-from format import format_goal, format_hypothesis
 from yattag import Doc
 
 Tag = Callable[..., Doc.Tag]
@@ -49,12 +48,13 @@ import linearize_semicolons
 import tokenizer
 
 from util import *
+from format import TacticContext
 from context_filter import get_context_filter
 
 from syntax import syntax_highlight, strip_comments
 
 from predict_tactic import static_predictors, loadPredictorByFile, loadPredictorByName
-from models.tactic_predictor import TacticPredictor, TacticContext
+from models.tactic_predictor import TacticPredictor
 
 finished_queue = queue.Queue() # type: queue.Queue[int]
 rows = queue.Queue() # type: queue.Queue[FileResult]
@@ -94,12 +94,6 @@ def details_header(tag : Any, doc : Doc, text : Text, filename : str) -> None:
 def report_header(tag : Any, doc : Doc, text : Text) -> None:
     header(tag, doc, text,report_css, report_js,
            "Proverbot Report")
-
-def stringified_percent(total : float, outof : float) -> str:
-    if outof == 0:
-        return "NaN"
-    else:
-        return "{:10.2f}".format(total * 100 / outof)
 
 def to_list_string(l : List[Any]) -> str:
     return "% ".join([str(item) for item in l])
@@ -374,12 +368,13 @@ class Worker(threading.Thread):
                     assert initial_context
                     hyps = coq.hypotheses
                     goals = coq.goals
+                    relevant_lemmas = coq.local_lemmas
                     if self.baseline:
                         predictions_and_certanties = [baseline_tactic + ".", 1] \
                                                      * num_predictions
                     else:
                         predictions_and_certainties, loss = net.predictKTacticsWithLoss(
-                            TacticContext(prev_tactics, hyps, goals),
+                            TacticContext(relevant_lemmas, prev_tactics, hyps, goals),
                             num_predictions,
                             command)
 
@@ -391,7 +386,8 @@ class Worker(threading.Thread):
                         coq.run_stmt(command)
                         actual_result_context = coq.proof_context
                         actual_result_goal = coq.goals
-                        actual_result_hypothesis = coq.hypotheses
+                        actual_result_hypotheses = coq.hypotheses
+                        actual_result_lemmas = coq.local_lemmas
                         assert isinstance(actual_result_context, str)
                     except (AckError, CompletedError, CoqExn,
                             BadResponse, ParseError, LexError, TimeoutError):
@@ -409,12 +405,15 @@ class Worker(threading.Thread):
                                           zip(prediction_runs,
                                               predictions_and_certainties)]
                     assert net.training_args
-                    if self.cfilter({"goal": format_goal(goals),
-                                     "hyps": format_hypothesis(hyps)},
+                    if self.cfilter(TacticContext(relevant_lemmas,
+                                                  prev_tactics,
+                                                  hyps,
+                                                  goals),
                                     command,
-                                    {"goal": format_goal(actual_result_goal),
-                                     "hyps":
-                                     format_hypothesis(actual_result_hypothesis)},
+                                    TacticContext(actual_result_lemmas,
+                                                  prev_tactics + [command],
+                                                  actual_result_hypotheses,
+                                                  actual_result_goal),
                                     net.training_args):
                         fresult.add_command_result(
                             [pred for pred, ctxt, ex in prediction_runs],
@@ -533,9 +532,6 @@ class Worker(threading.Thread):
         finally:
             finished_queue.put(self.workerid)
 
-def escape_filename(filename : str) -> str:
-    return re.sub("/", "Zs", re.sub("\.", "Zd", re.sub("Z", "ZZ", filename)))
-
 def main(arg_list : List[str]) -> None:
     global jobs
     global num_jobs
@@ -567,7 +563,7 @@ def main(arg_list : List[str]) -> None:
     parser.add_argument('filenames', nargs="+", help="proof file name (*.v)", type=Path2)
     args = parser.parse_args(arg_list)
 
-    coqargs = ["sertop"]
+    coqargs = ["sertop", "--implicit"]
     includes = subprocess.Popen(['make', '-C', str(args.prelude), 'print-includes'],
                                 stdout=subprocess.PIPE).communicate()[0].decode('utf-8')
 

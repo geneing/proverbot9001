@@ -27,6 +27,7 @@ import serapi_instance
 from format import *
 from util import *
 from data import read_all_text_data
+from pathlib_revised import Path2
 
 from typing import Dict, Tuple, Any, cast, Pattern, Match
 
@@ -49,8 +50,6 @@ def parse_arguments() -> Tuple[argparse.Namespace, argparse.ArgumentParser]:
     parser.add_argument('--debug', action='store_true')
     parser.add_argument('--progress', action='store_true')
     parser.add_argument('--outfile', '-o', default="proofs.csv", type=str)
-    parser.add_argument("--max-length", dest="max_length", type=int,
-                        default=120)
     g = parser.add_mutually_exclusive_group()
     g.add_argument("--post-linearized", dest="post_linear", action='store_true')
     g.add_argument("--add-semis", dest="add_semis", action='store_true')
@@ -69,7 +68,7 @@ def norm(statement : str):
 def count_lengths(args : argparse.Namespace, filename : str):
     print(f"Counting {filename}")
     full_filename = args.prelude + "/" + filename
-    scraped_commands = list(read_all_text_data(full_filename + ".scrape"))
+    scraped_commands = list(read_all_text_data(Path2(full_filename + ".scrape")))
     scraped_iter = iter(scraped_commands)
     if args.post_linear:
         original_commands = serapi_instance.load_commands_preserve(args, 0,

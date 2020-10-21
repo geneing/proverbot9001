@@ -30,12 +30,13 @@ from argparse import Namespace
 from util import *
 from data import Sentence, SOS_token, EOS_token, TOKEN_START, get_text_data, RawDataset
 from data import getNGramTokenbagVector
-from models.tactic_predictor import TacticPredictor, Prediction, TacticContext
+from models.tactic_predictor import TacticPredictor, Prediction
 from models.components import SimpleEmbedding
 from tokenizer import Tokenizer, tokenizers, make_keyword_tokenizer_relevance
 from models.args import start_std_args, optimizers
 from models.components import DNNClassifier, EncoderDNN, DecoderGRU
 import serapi_instance
+from format import TacticContext
 
 from typing import List, Dict, Tuple, NamedTuple, Union, Callable, \
     Optional, Iterator, Counter
@@ -292,16 +293,16 @@ def encode_hyparg_data(data : RawDataset,
         subset = random.sample(data_list, entropy_data_size)
     tokenizer = make_keyword_tokenizer_relevance(
         [(context, stem_embedding.encode_token(serapi_instance.get_stem(tactic)))
-         for prev_tactics, hyps, context, tactic in subset],
+         for relevant_lemmas, prev_tactics, hyps, context, tactic in subset],
         tokenizer_type, num_keywords, num_reserved_tokens)
     termEncoder = functools.partial(getNGramTokenbagVector, 1, tokenizer.numTokens())
     with multiprocessing.Pool(num_threads) as pool:
         hyps, contexts, tactics = zip(*data_list)
-        encoded_contexts = pool.imap_unordered(functools.partial(
+        encoded_contexts = pool.imap(functools.partial(
             _encode, tokenizer, termEncoder), contexts)
-        encoded_hyps = pool.imap_unordered(functools.partial(
+        encoded_hyps = pool.imap(functools.partial(
             _encode_hyps, tokenizer, termEncoder, max_hyps, encoded_length), contexts)
-        encoded_tactics = pool.imap_unordered(
+        encoded_tactics = pool.imap(
             functools.partial(encode_tactic_structure, stem_embedding, max_args),
             zip(hyps, tactics))
         result = list(zip(encoded_hyps, encoded_contexts, encoded_tactics))

@@ -13,12 +13,14 @@ if [[ -f /etc/NIXOS ]]; then
 else
     opam init -a --compiler=4.07.1
     eval `opam config env`
+    opam update
     # For Coq:
-    opam pin add menhir 20181113
-    opam install -y menhir
+    opam pin add coq 8.11.0
+    opam pin -y add menhir 20190626
     # For SerAPI:
     opam install -y coq-serapi
     pip3 install --user -r requirements.txt
+    make src/dataloader.so
 fi
 
 function check-and-clone {
@@ -27,18 +29,6 @@ function check-and-clone {
     fi
     (cd $1 && git fetch && git checkout $3) || exit 1
 }
-
-function setup-coq-menhir {
-    check-and-clone\
-        "coq-menhirlib" "https://gitlab.inria.fr/fpottier/coq-menhirlib.git"\
-        "ca0655b2f96057a271fb5c9a254a38d195b4a7f9"
-    (
-        set -euv
-        cd coq-menhirlib
-        make && make install
-    )
-}
-
 function setup-compcert {
     check-and-clone\
         "CompCert" "https://github.com/AbsInt/CompCert.git"\

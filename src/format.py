@@ -20,80 +20,113 @@
 #
 ##########################################################################
 
-import re
-from typing import List, Tuple, TextIO, Optional, NamedTuple, Union
+import json
+from typing import List, TextIO, Optional, NamedTuple, Union, Dict, Any, Type
+
+
+class Obligation(NamedTuple):
+    hypotheses: List[str]
+    goal: str
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(**data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"hypotheses": self.hypotheses,
+                "goal": self.goal}
+
+
+class ProofContext(NamedTuple):
+    fg_goals: List[Obligation]
+    bg_goals: List[Obligation]
+    shelved_goals: List[Obligation]
+    given_up_goals: List[Obligation]
+
+    @classmethod
+    def empty(cls: Type['ProofContext']):
+        return ProofContext([], [], [], [])
+
+    @classmethod
+    def from_dict(cls, data):
+        fg_goals = list(map(Obligation.from_dict, data["fg_goals"]))
+        bg_goals = list(map(Obligation.from_dict, data["bg_goals"]))
+        shelved_goals = list(map(Obligation.from_dict, data["shelved_goals"]))
+        given_up_goals = list(map(Obligation.from_dict,
+                                  data["given_up_goals"]))
+        return cls(fg_goals, bg_goals, shelved_goals, given_up_goals)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"fg_goals": list(map(Obligation.to_dict, self.fg_goals)),
+                "bg_goals": list(map(Obligation.to_dict, self.bg_goals)),
+                "shelved_goals": list(map(Obligation.to_dict,
+                                          self.shelved_goals)),
+                "given_up_goals": list(map(Obligation.to_dict,
+                                           self.given_up_goals))}
+
+    @property
+    def all_goals(self) -> List[Obligation]:
+        return self.fg_goals + self.bg_goals + \
+            self.shelved_goals + self.given_up_goals
+
+    @property
+    def focused_goal(self) -> str:
+        if self.fg_goals:
+            return self.fg_goals[0].goal
+        else:
+            return ""
+
+    @property
+    def focused_hyps(self) -> List[str]:
+        if self.fg_goals:
+            return self.fg_goals[0].hypotheses
+        else:
+            return []
+
 
 class ScrapedTactic(NamedTuple):
-    prev_tactics : List[str]
-    hypotheses : List[str]
-    goal : str
-    tactic : str
+    relevant_lemmas: List[str]
+    prev_tactics: List[str]
+    context: ProofContext
+    tactic: str
+
+
+class TacticContext(NamedTuple):
+    relevant_lemmas: List[str]
+    prev_tactics: List[str]
+    hypotheses: List[str]
+    goal: str
+
 
 ScrapedCommand = Union[ScrapedTactic, str]
 
-def minimize_whitespace(data : str) -> str:
-    return re.sub("\s+", " ", data).strip()
 
-def format_context(prev_tactics : List[str], prev_hyps : List[str], prev_goal : str,
-                   rel_lemmas : str) -> str:
-    return (format_tactics(prev_tactics) + "\n*****\n" +
-            format_hypothesis(prev_hyps) + "\n*****\n" +
-            # format_lemmas(rel_lemmas) + "*****\n" +
-            format_goal(prev_goal) + "\n+++++\n")
-
-def format_tactics(tactics : List[str]) -> str:
-    return "\n".join([minimize_whitespace(tactic) for tactic in tactics]) + "\n"
-
-def format_hypothesis(prev_hyps : List[str]) -> str:
-    return "\n".join([re.sub(r"\n", r"\\n", re.sub("[ \t]+", " ", prev_hyp.strip())).strip() for prev_hyp in prev_hyps])
-
-def format_goal(prev_goal : str) -> str:
-    return minimize_whitespace(prev_goal)
-
-def format_lemmas(rel_lemmas : str) -> str:
-    return re.sub("[ \t]+", " ", rel_lemmas).strip()
-
-def format_tactic(tactic : str):
-    return minimize_whitespace(tactic) + "\n-----\n"
-
-def read_tuple(f_handle : TextIO) -> Optional[ScrapedCommand]:
-    lines : List[str] = []
-    next_line = f_handle.readline()
-    while next_line != "-----\n" and next_line != "":
-        lines.append(next_line)
-        next_line = f_handle.readline()
-    if len(lines) == 0:
-        return None
-    elif len(lines) == 1:
-        return "\n" + re.sub(r"\\n", r"\n", lines[0])
+def strip_scraped_output(scraped: ScrapedTactic) -> TacticContext:
+    relevant_lemmas, prev_tactics, context, tactic = scraped
+    if context and context.fg_goals:
+        return TacticContext(relevant_lemmas, prev_tactics,
+                             context.fg_goals[0].hypotheses,
+                             context.fg_goals[0].goal)
     else:
-        prev_tactics : List[str] = []
-        lines_it = iter(lines)
-        for line in lines_it:
-            if line == "*****\n":
-                break
-            elif line.strip() == "":
-                continue
-            else:
-                prev_tactics.append(line.strip())
-        hyps : List[str] = []
-        for line in lines_it:
-            if line == "*****\n":
-                break
-            elif line.strip() == "":
-                continue
-            else:
-                hyps.append(line.strip())
-        try:
-            goal = next(lines_it)
-            assert next(lines_it) == "+++++\n"
-            tactic = next(lines_it)
-            return ScrapedTactic(prev_tactics=prev_tactics, hypotheses=hyps,
-                                 goal=goal, tactic=tactic)
-        except StopIteration:
-            return None
+        return TacticContext(relevant_lemmas, prev_tactics,
+                             [], "")
 
-def read_tactic_tuple(f_handle : TextIO) -> Optional[ScrapedTactic]:
+
+def read_tuple(f_handle: TextIO) -> Optional[ScrapedCommand]:
+    line = f_handle.readline()
+    if line.strip() == "":
+        return None
+    obj = json.loads(line)
+    if isinstance(obj, str):
+        return obj
+    else:
+        return ScrapedTactic(obj["relevant_lemmas"],
+                             obj["prev_tactics"],
+                             ProofContext.from_dict(obj["context"]),
+                             obj["tactic"])
+
+
+def read_tactic_tuple(f_handle: TextIO) -> Optional[ScrapedTactic]:
     next_tuple = read_tuple(f_handle)
     while(isinstance(next_tuple, str)):
         next_tuple = read_tuple(f_handle)

@@ -27,34 +27,39 @@ from models.components import (EncoderRNN, WordFeaturesEncoder, Embedding, add_n
 from features import (WordFeature, VecFeature,
                       word_feature_constructors, vec_feature_constructors)
 from models.tactic_predictor import (TrainablePredictor,
-                                     NeuralPredictorState,
-                                     TacticContext, Prediction,
+                                     NeuralPredictorState, Prediction,
                                      optimize_checkpoints,
                                      save_checkpoints, tokenize_goals,
-                                     embed_data, add_tokenizer_args,
-                                     strip_scraped_output)
+                                     embed_data, add_tokenizer_args)
 from tokenizer import Tokenizer, limitNumTokens, get_symbols
 from data import (ListDataset, normalizeSentenceLength, RawDataset,
                   EmbeddedSample)
-from util import *
-from format import ScrapedTactic
+from util import maybe_cuda, LongTensor, FloatTensor, topk_with_filter
+from format import TacticContext, strip_scraped_output
 import serapi_instance
 
 import threading
 import multiprocessing
 import functools
 import sys
-from typing import List, NamedTuple, cast, Sequence, Dict
+import torch
+import time
+import math
+from typing import (List, NamedTuple, cast, Sequence, Dict, Tuple,
+                    Optional, Any, Iterable)
 import argparse
 from argparse import Namespace
 from difflib import SequenceMatcher
 
+
 class HypFeaturesSample(NamedTuple):
-    word_features : List[int]
-    vec_features : List[float]
-    goal : List[int]
-    best_hypothesis : List[int]
-    next_tactic : int
+    word_features: List[int]
+    vec_features: List[float]
+    goal: List[int]
+    best_hypothesis: List[int]
+    next_tactic: int
+
+
 class HypFeaturesDataset(ListDataset[HypFeaturesSample]):
     pass
 
@@ -115,9 +120,9 @@ class HypFeaturesPredictor(TrainablePredictor[HypFeaturesDataset,
         assert self.training_args
         goals_batch = [normalizeSentenceLength(self._tokenizer.toTokenList(goal),
                                                self.training_args.max_length)
-                       for _, _, goal in in_datas]
+                       for _, _, _, goal in in_datas]
         hyps = [get_closest_hyp(hyps, goal, self.training_args.max_length)
-                for _, hyps, goal in in_datas]
+                for _, _, hyps, goal in in_datas]
         hyp_types = [serapi_instance.get_hyp_type(hyp) for hyp in hyps]
         hyps_batch = [normalizeSentenceLength(
             self._tokenizer.toTokenList(hyp_type),
@@ -146,18 +151,17 @@ class HypFeaturesPredictor(TrainablePredictor[HypFeaturesDataset,
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[HypFeaturesDataset, Tuple[Tokenizer, Embedding,
                                            List[WordFeature], List[VecFeature]]]:
-        preprocessed_data = list(self._preprocess_data(data, arg_values))
         start = time.time()
         print("Stripping...", end="")
         sys.stdout.flush()
-        stripped_data = [strip_scraped_output(dat) for dat in preprocessed_data]
+        stripped_data = [strip_scraped_output(dat) for dat in data]
         print("{:.2f}s".format(time.time() - start))
-        self._word_feature_functions  = [feature_constructor(stripped_data, arg_values) for # type: ignore
-                                       feature_constructor in
+        self._word_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
+                                        feature_constructor in
                                         word_feature_constructors]
         self._vec_feature_functions = [feature_constructor(stripped_data, arg_values) for # type: ignore
                                        feature_constructor in vec_feature_constructors]
-        embedding, embedded_data = embed_data(RawDataset(preprocessed_data))
+        embedding, embedded_data = embed_data(data)
         tokenizer, tokenized_goals = tokenize_goals(embedded_data, arg_values)
         with multiprocessing.Pool(arg_values.num_threads) as pool:
             start = time.time()
@@ -166,7 +170,7 @@ class HypFeaturesPredictor(TrainablePredictor[HypFeaturesDataset,
             tokenized_hyps = list(pool.imap(functools.partial(get_closest_hyp_type,
                                                               tokenizer,
                                                               arg_values.max_length),
-                                            preprocessed_data))
+                                            data))
             print("{:.2f}s".format(time.time() - start))
             start = time.time()
             print("Creating dataset...", end="")
@@ -208,6 +212,7 @@ class HypFeaturesPredictor(TrainablePredictor[HypFeaturesDataset,
 
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : Tuple[Tokenizer, Embedding,
                                           List[WordFeature], List[VecFeature]],
                          state : NeuralPredictorState) -> None:
@@ -221,10 +226,18 @@ class HypFeaturesPredictor(TrainablePredictor[HypFeaturesDataset,
         self.training_loss = state.loss
         self.num_epochs = state.epoch
         self.training_args = args
-    def _data_tensors(self, encoded_data : HypFeaturesDataset,
-                      arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        word_features, vec_features, goals, hyps, tactics = zip(*encoded_data)
+        self.unparsed_args = unparsed_args
+
+    def _data_tensors(self, encoded_data: HypFeaturesDataset,
+                      arg_values: Namespace) \
+            -> List[torch.Tensor]:
+        word_features, vec_features, goals, hyps, tactics = \
+            cast(Tuple[List[List[int]],
+                       List[List[float]],
+                       List[List[int]],
+                       List[List[int]],
+                       List[int]],
+                 zip(*encoded_data))
         return [torch.LongTensor(word_features),
                 torch.FloatTensor(vec_features),
                 torch.LongTensor(goals),
@@ -413,8 +426,8 @@ def mkHFSample(max_length : int,
                zipped : Tuple[EmbeddedSample, List[int], List[int]]) \
     -> HypFeaturesSample:
     context, goal, best_hyp = zipped
-    (prev_tactic_list, hypotheses, goal_str, tactic) = context
-    tac_context = TacticContext(prev_tactic_list, hypotheses, goal_str)
+    (relevant_lemmas, prev_tactic_list, hypotheses, goal_str, tactic) = context
+    tac_context = TacticContext(relevant_lemmas, prev_tactic_list, hypotheses, goal_str)
     return HypFeaturesSample([feature(tac_context)
                               for feature in word_feature_functions],
                              [feature_val for feature in vec_feature_functions

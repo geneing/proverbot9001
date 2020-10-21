@@ -1,4 +1,24 @@
 #!/usr/bin/env python3.7
+##########################################################################
+#
+#    This file is part of Proverbot9001.
+#
+#    Proverbot9001 is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    Proverbot9001 is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with Proverbot9001.  If not, see <https://www.gnu.org/licenses/>.
+#
+#    Copyright 2019 Alex Sanchez-Stern and Yousef Alhessi
+#
+##########################################################################
 
 from typing import Dict, Any, List
 from abc import ABCMeta, abstractmethod
@@ -36,12 +56,22 @@ class SimpleEmbedding(Embedding):
     def has_token(self, token : str) -> bool :
         return token in self.tokens_to_indices
 
+    def from_file(filepath: str) -> 'SimpleEmbedding':
+        embedding = SimpleEmbedding()
+        embedding.tokens_to_indices["NOSTEM"] = 0
+        embedding.indices_to_tokens[0] = "NOSTEM"
+        with open(filepath, 'r') as f:
+            for idx, line in enumerate(f):
+                embedding.tokens_to_indices[line.strip()] = idx + 1
+                embedding.indices_to_tokens[idx + 1] = line.strip()
+        return embedding
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from util import *
-from typing import TypeVar, Generic
+from util import maybe_cuda, eprint
+from typing import TypeVar, Generic, Iterable, Tuple
 import argparse
 
 S = TypeVar("S")
@@ -70,6 +100,8 @@ def add_nn_args(parser : argparse.ArgumentParser,
                         choices=list(optimizers.keys()), type=str,
                         default=default_values.get("optimizer",
                                                    list(optimizers.keys())[0]))
+    parser.add_argument("--max-premises", dest="max_premises", type=int,
+                        default=default_values.get("max-premises", 20))
 
 class StraightlineClassifierModel(Generic[S], metaclass=ABCMeta):
     @staticmethod
@@ -108,6 +140,60 @@ class DNNClassifier(nn.Module):
             layer_values = getattr(self, "_layer{}".format(i))(layer_values)
         layer_values = F.relu(layer_values)
         return self.softmax(self.out_layer(layer_values)).view(input.size()[0], -1)
+
+
+class DNNScorer(nn.Module):
+    def __init__(self, input_vocab_size: int, hidden_size: int, num_layers) \
+          -> None:
+        super().__init__()
+        self.num_layers = num_layers
+        if self.num_layers > 1:
+            self.in_layer = maybe_cuda(nn.Linear(input_vocab_size,
+                                                 hidden_size))
+        for i in range(num_layers - 2):
+            self.add_module("_layer{}".format(i),
+                            maybe_cuda(nn.Linear(hidden_size, hidden_size)))
+        if self.num_layers > 1:
+            self.out_layer = maybe_cuda(nn.Linear(hidden_size, 1))
+        else:
+            self.out_layer = maybe_cuda(nn.Linear(input_vocab_size, 1))
+
+    def forward(self, input: torch.FloatTensor) -> torch.FloatTensor:
+        if self.num_layers > 1:
+            layer_values = self.in_layer(maybe_cuda(Variable(input)))
+        else:
+            layer_values = input
+        for i in range(self.num_layers - 2):
+            layer_values = F.relu(layer_values)
+            layer_values = getattr(self, "_layer{}".format(i))(layer_values)
+        return self.out_layer(layer_values)
+
+    def print_weights(self) -> None:
+        if self.num_layers > 1:
+            eprint("In layer:")
+            for param in self.in_layer.parameters():
+                eprint(param.data)
+        for i in range(self.num_layers - 2):
+            eprint(f"Hidden layer {i}:")
+            for param in getattr(self, "_layer{}".format(i)).parameters():
+                eprint(param.data)
+        eprint("Out layer:")
+        for param in self.out_layer.parameters():
+            eprint(param.data)
+
+    def print_grads(self) -> None:
+        if self.num_layers > 1:
+            eprint("In layer:")
+            for param in self.in_layer.parameters():
+                eprint(param.grad)
+        for i in range(self.num_layers - 2):
+            eprint(f"Hidden layer {i}:")
+            for param in getattr(self, "_layer{}".format(i)).parameters():
+                eprint(param.grad)
+        eprint("Out layer:")
+        for param in self.out_layer.parameters():
+            eprint(param.grad)
+
 
 class WordFeaturesEncoder(nn.Module):
     def __init__(self, input_vocab_sizes : List[int],
@@ -251,7 +337,11 @@ optimizers = {
 }
 
 @dataclass(init=True)
-class NeuralPredictorState:
+class PredictorState:
+    epoch : int
+
+@dataclass(init=True)
+class NeuralPredictorState(PredictorState):
     epoch : int
     loss : float
     weights : Dict[str, Any]
@@ -301,11 +391,11 @@ class DNNClassifierModel(StraightlineClassifierModel[NeuralPredictorState]):
             for batch_num, data_batch in enumerate(dataloader, start=1):
                 self._optimizer.zero_grad()
                 input_batch, output_batch = data_batch
-                with autograd.detect_anomaly():
-                    predictionDistribution = self._model(input_batch)
-                    output_var = maybe_cuda(Variable(output_batch))
-                    loss = self._criterion(predictionDistribution, output_var)
-                    loss.backward()
+                # with autograd.detect_anomaly():
+                predictionDistribution = self._model(input_batch)
+                output_var = maybe_cuda(Variable(output_batch))
+                loss = self._criterion(predictionDistribution, output_var)
+                loss.backward()
                 self._optimizer.step()
 
                 epoch_loss += loss.item()

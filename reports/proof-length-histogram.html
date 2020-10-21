@@ -5,7 +5,10 @@
   <style>
 
     .axis {
-	font: 10px sans-serif;
+	font: 30px sans-serif;
+    }
+    text {
+        font: 16px sans-serif;
     }
 
     .axis path,
@@ -15,13 +18,16 @@
 	shape-rendering: crispEdges;
     }
     .bar-failed {
-        fill: pink;
+	stroke: #000;
+        fill: #1f78b4;
     }
     .bar-success{
-        fill: lightgreen;
+	stroke: #000;
+        fill: #b2df8a;
     }
     .bar-incomplete {
-        fill: peachpuff;
+	stroke: #000;
+        fill: url(#hash);
     }
 
   </style>
@@ -33,11 +39,11 @@
 
 <script>
 
-  var margin = {top: 20, right: 20, bottom: 70, left: 40},
+  var margin = {top: 20, right: 20, bottom: 70, left: 70},
       width = 600 - margin.left - margin.right,
       height = 300 - margin.top - margin.bottom;
 
-  var x = d3.scaleLog().range([0, width]);
+  var x = d3.scaleLinear().range([0, width]);
 
   var y = d3.scaleLinear().range([height, 0]);
 
@@ -64,40 +70,59 @@
           return d.status == "SearchStatus.FAILURE";})
       inc_data = data.filter(function(d) {
           return d.status == "SearchStatus.INCOMPLETE";})
-      x.domain([1, d3.max(data, function(d) { return d.prooflength; })]);
+      x.domain([1, 10])//d3.max(data, function(d) { return d.prooflength; })]);
       var histogram = d3.histogram()
           .value(function(d) { return d.prooflength; })
           .domain(x.domain())
-          .thresholds(x.ticks(5));
+          .thresholds(x.ticks(16));
 
       var bins = histogram(data)
       var succ_bins = histogram(succ_data)
       var fail_bins = histogram(fail_data)
       var inc_bins = histogram(inc_data)
       var bin_tuples = succ_bins.map(function(e, i) {
-          return [e, inc_bins[i], fail_bins[i]]
+          return [fail_bins[i], inc_bins[i], e]
       });
 
       y.domain([0, d3.max(bins, function(d) { return d.length; })]);
+
+      var pattern = svg.append("defs")
+          .append("pattern")
+          .attr("id", "hash")
+          .attr("width", 8)
+          .attr("height", 8)
+          .attr("fill", "#ffffff")
+          .attr("patternUnits", "userSpaceOnUse")
+          .attr("patternTransform", "rotate(45)")
+      pattern.append("rect")
+          .attr("width", 2)
+          .attr("height", 8)
+          .attr("transform", "translate(0,0)")
+          .attr("fill", "#a6cee3")
+      pattern.append("rect")
+          .attr("width", 8)
+          .attr("height", 2)
+          .attr("transform", "translate(0,0)")
+          .attr("fill", "#a6cee3")
       // append the bar rectangles to the svg element
       svg.selectAll(null)
           .data(bin_tuples)
           .enter().append("rect")
-          .attr("class", "bar-success")
+          .attr("class", "bar-failed")
           .attr("x", 1)
           .attr("transform", function(d) {
               return "translate(" + x(d[0].x0) + "," +
                   (y(d[0].length + d[1].length + d[2].length)) + ")"; })
-          .attr("width", function(d) { return x(d[0].x1) - x(d[0].x0) -1 ; })
+          .attr("width", function(d) { return x(d[0].x1) - x(d[0].x0)-1; })
           .attr("height", function(d) {
-              return height - y(d[0].length + d[1].length + d[2].length);
+              return height - y(d[0].length);
            })
           .on("mouseover", function () { tooltip.style("display", null); })
           .on("mouseout", function () { tooltip.style("display", "none"); })
           .on("mousemove", function(d) {
               var xPosition = d3.mouse(this)[0] + x(d[0].x0) - 15;
               var yPosition = d3.mouse(this)[1] +
-                  y(d[0].length + d[1].length + d[2].length) - 60;
+                  y(d[0].length + d[1].length + d[2].length) - 30;
               tooltip.attr("transform", "translate(" + xPosition + "," + yPosition + ")");
               tooltip.select("text").text(d[0].length);
           });
@@ -118,14 +143,14 @@
           .on("mousemove", function(d) {
               var xPosition = d3.mouse(this)[0] + x(d[1].x0) - 15;
               var yPosition = d3.mouse(this)[1] +
-                  y(d[1].length + d[2].length) - 60;
+                  y(d[1].length + d[2].length) - 30;
               tooltip.attr("transform", "translate(" + xPosition + "," + yPosition + ")");
               tooltip.select("text").text(d[1].length);
           });
       svg.selectAll(null)
            .data(bin_tuples)
            .enter().append("rect")
-           .attr("class", "bar-failed")
+           .attr("class", "bar-success")
            .attr("x", 1)
            .attr("transform", function(d) {
                return "translate(" + x(d[0].x0) + "," +
@@ -139,7 +164,7 @@
           .on("mousemove", function(d) {
               var xPosition = d3.mouse(this)[0] + x(d[1].x0) - 15;
               var yPosition = d3.mouse(this)[1] +
-                  y(d[2].length) - 60;
+                  y(d[2].length) - 30;
               tooltip.attr("transform", "translate(" + xPosition + "," + yPosition + ")");
               tooltip.select("text").text(d[2].length);
           });
@@ -148,18 +173,35 @@
       svg.append("g")
           .attr("transform", "translate(0," + height + ")")
           .call(d3.axisBottom(x).tickFormat(function (d) {
-              if (d < 100){
+              // if (d < 100){
                   return d + '';
-              } else {
-                  return d.toExponential();
-              }
+              // } else {
+              //     return d.toExponential();
+              // }
           }))
           .selectAll("text")
           .attr("transform", "translate(0, 5) rotate(50)");
 
+      svg.append("text")
+          .attr("transform",
+                "translate(" + (width/2) + " ," +
+                (height + margin.top + 20) + ")")
+          .style("text-anchor", "middle")
+          .style("font-size", "20px")
+          .text("Length of original proof");
+
       // add the y Axis
       svg.append("g")
           .call(d3.axisLeft(y));
+      svg.append("text")
+          .attr("transform", "rotate(-90)")
+          .attr("y", 0 - margin.left)
+          .attr("x",0 - (height / 2))
+          .attr("dy", "1em")
+          .style("text-anchor", "middle")
+          .style("font-size", "20px")
+          .text("# of proofs");
+
 
       var tooltip = svg.append("g")
           .attr("class", "tooltip")

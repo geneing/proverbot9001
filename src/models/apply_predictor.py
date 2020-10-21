@@ -19,17 +19,18 @@
 #
 ##########################################################################
 from models.tactic_predictor import \
-    (NeuralPredictorState, TrainablePredictor, TacticContext,
+    (NeuralPredictorState, TrainablePredictor,
      Prediction, save_checkpoints, optimize_checkpoints, embed_data,
      predictKTactics, predictKTacticsWithLoss,
      predictKTacticsWithLoss_batch, add_tokenizer_args,
-     strip_scraped_output, tokenize_goals, tokenize_hyps)
+     tokenize_goals, tokenize_hyps)
 from models.components import (Embedding, SimpleEmbedding, DNNClassifier, add_nn_args)
 from data import (Sentence, ListDataset, RawDataset,
-                  normalizeSentenceLength, getNGramTokenbagVector)
+                  normalizeSentenceLength, getNGramTokenbagVector,
+                  TacticContext)
 from tokenizer import Tokenizer
 import serapi_instance
-from format import ScrapedTactic
+from format import ScrapedTactic, TacticContext, strip_scraped_output
 from util import *
 
 import torch
@@ -48,10 +49,11 @@ import functools
 
 TermType = List[int]
 
+
 class HypothesisRelevanceSample(NamedTuple):
-    hypothesis : TermType
-    goal : TermType
-    isRelevant : bool
+    hypothesis: TermType
+    goal: TermType
+    isRelevant: bool
 
 class ApplyDataset(ListDataset[HypothesisRelevanceSample]):
     pass
@@ -115,21 +117,20 @@ class ApplyPredictor(TrainablePredictor[ApplyDataset,
                             default=default_values.get("hidden-size", 128))
         parser.add_argument("--num-layers", dest="num_layers", type=int,
                             default=default_values.get("num-layers", 3))
-    def _determine_relevance(self, inter : ScrapedTactic) -> List[bool]:
-        stem, args_string  = serapi_instance.split_tactic(inter.tactic)
+
+    def _determine_relevance(self, inter: ScrapedTactic) -> List[bool]:
+        stem, args_string = serapi_instance.split_tactic(inter.tactic)
         args = args_string[:-1].split()
         return [any([var.strip() in args for var in
                      serapi_instance.get_var_term_in_hyp(hyp).split(",")])
-                for hyp in inter.hypotheses]
+                for hyp in inter.context.focused_hyps]
 
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[ApplyDataset, Tokenizer]:
-        preprocessed_data = list(self._preprocess_data(data, arg_values))
-        isRelevants = [self._determine_relevance(inter) for inter in preprocessed_data]
-        embedding, embedded_data = embed_data(RawDataset(preprocessed_data))
+        isRelevants = [self._determine_relevance(inter) for inter in data]
+        embedding, embedded_data = embed_data(data)
         tokenizer, tokenized_goals = tokenize_goals(embedded_data, arg_values)
-        tokenized_hyp_lists = tokenize_hyps(RawDataset(preprocessed_data), arg_values,
-                                            tokenizer)
+        tokenized_hyp_lists = tokenize_hyps(data, arg_values, tokenizer)
         with multiprocessing.Pool(None) as pool:
             encoded_hyp_lists = list(pool.imap(functools.partial(encodeHypList,
                                                                  arg_values.num_grams,
@@ -170,6 +171,7 @@ class ApplyPredictor(TrainablePredictor[ApplyDataset,
                                     self._getBatchPredictionLoss(batch_tensors, model))
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          tokenizer : Tokenizer,
                          state : NeuralPredictorState) -> None:
         self._tokenizer = tokenizer
@@ -178,15 +180,21 @@ class ApplyPredictor(TrainablePredictor[ApplyDataset,
         self.training_loss = state.loss
         self.num_epochs = state.epoch
         self.training_args = args
-    def _data_tensors(self, encoded_data : ApplyDataset,
-                      arg_values : Namespace) \
-        -> List[torch.Tensor]:
-        hypotheses, goals, relevance = zip(*encoded_data)
+        self.unparsed_args = unparsed_args
+
+    def _data_tensors(self, encoded_data: ApplyDataset,
+                      arg_values: Namespace) \
+            -> List[torch.Tensor]:
+        hypotheses, goals, relevance = cast(Tuple[List[TermType],
+                                                  List[TermType],
+                                                  List[bool]],
+                                            zip(*encoded_data))
         hypothesesTensor = torch.FloatTensor(hypotheses)
         goalsTensor = torch.FloatTensor(goals)
         relevanceTensor = torch.LongTensor(relevance)
         tensors = [hypothesesTensor, goalsTensor, relevanceTensor]
         return tensors
+
     def _get_model(self, arg_values : Namespace, num_tokens : int) \
         -> DNNClassifier:
         return DNNClassifier(2 * (num_tokens ** arg_values.num_grams),

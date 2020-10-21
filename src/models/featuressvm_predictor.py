@@ -19,14 +19,15 @@
 #
 ##########################################################################
 from models.tactic_predictor import \
-    (TrainablePredictor, TacticContext, Prediction,
-     optimize_checkpoints, embed_data, predictKTactics,
-     predictKTacticsWithLoss, predictKTacticsWithLoss_batch, strip_scraped_output)
-from models.components import (Embedding)
+    (TrainablePredictor, Prediction, optimize_checkpoints, embed_data,
+     predictKTactics, predictKTacticsWithLoss,
+     predictKTacticsWithLoss_batch)
+from models.components import (Embedding, PredictorState)
 from data import (Sentence, ListDataset, RawDataset,
                   normalizeSentenceLength)
 from serapi_instance import get_stem
 from util import *
+from format import TacticContext, strip_scraped_output
 
 from typing import (List, Any, Tuple, NamedTuple, Dict, Sequence,
                     cast, Optional)
@@ -50,11 +51,15 @@ class FeaturesSample(NamedTuple):
     features : List[float]
     next_tactic : int
 
+@dataclass
+class FeaturesSVMState(PredictorState):
+    inner : svm.SVC
+
 class FeaturesDataset(ListDataset[FeaturesSample]):
     pass
 class FeaturesSVMPredictor(TrainablePredictor[FeaturesDataset,
                                               Tuple[Embedding, List[VecFeature]],
-                                              svm.SVC]):
+                                              FeaturesSVMState]):
     def __init__(self) \
         -> None:
         self._feature_functions : Optional[List[VecFeature]] = None
@@ -82,11 +87,10 @@ class FeaturesSVMPredictor(TrainablePredictor[FeaturesDataset,
                 for feature_val in feature(context)]
     def _encode_data(self, data : RawDataset, arg_values : Namespace) \
         -> Tuple[FeaturesDataset, Tuple[Embedding, List[VecFeature]]]:
-        preprocessed_data = list(self._preprocess_data(data, arg_values))
-        stripped_data = [strip_scraped_output(dat) for dat in preprocessed_data]
+        stripped_data = [strip_scraped_output(dat) for dat in data]
         self._feature_functions = [feature_constructor(stripped_data, arg_values) for
                                    feature_constructor in vec_feature_constructors]
-        embedding, embedded_data = embed_data(RawDataset(preprocessed_data))
+        embedding, embedded_data = embed_data(data)
         return (FeaturesDataset([
             FeaturesSample(self._get_features(strip_scraped_output(scraped)),
                            scraped.tactic)
@@ -107,16 +111,18 @@ class FeaturesSVMPredictor(TrainablePredictor[FeaturesDataset,
         loss = model.score(inputs, outputs)
         print("Training loss: {}".format(loss))
         with open(arg_values.save_file, 'wb') as f:
-            torch.save(("featuressvm", (arg_values, metadata, model)), f)
+            torch.save(("featuressvm", (arg_values, metadata, FeaturesSVMState(1, model))), f)
     def _description(self) -> str:
         return "An svm predictor using only hand-engineered features"
     def load_saved_state(self,
                          args : Namespace,
+                         unparsed_args : List[str],
                          metadata : Tuple[Embedding, List[VecFeature]],
-                         state : svm.SVC) -> None:
+                         state : FeaturesSVMState) -> None:
         self._embedding, self._feature_functions = metadata
-        self._model = state
+        self._model = state.inner
         self.training_args = args
+        self.unparsed_args = unparsed_args
     def getOptions(self) -> List[Tuple[str, str]]:
         return list(vars(self.training_args).items())
     def predictKTactics(self, in_data : TacticContext, k : int) \
