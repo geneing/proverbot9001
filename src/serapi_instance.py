@@ -1454,6 +1454,7 @@ def next_proof(cmds: Iterator[str]) -> Iterator[str]:
 
 
 def preprocess_command(cmd: str) -> List[str]:
+    return [cmd]
     needPrefix = ["String", "Classical", "ClassicalFacts",
                   "ClassicalDescription", "ClassicalEpsilon",
                   "Equivalence", "Init.Wf", "Program.Basics",
