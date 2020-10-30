@@ -1374,7 +1374,7 @@ def SerapiContext(coq_commands: List[str], module_name: str,
 
 
 normal_lemma_starting_patterns = [
-    r"(?:Local|Global\s+)?Lemma",
+    "Lemma",
     "Coercion",
     "Theorem",
     "Remark",
@@ -1386,8 +1386,7 @@ normal_lemma_starting_patterns = [
     "Corollary",
     "Let",
     r"(?<!Declare\s)Instance",
-    "Global Instance",
-    "Local Instance",
+    "(?:(?:Local|Global)\s+)Instance",
     "Function",
     "Property",
     "Fact"]
@@ -1405,7 +1404,8 @@ lemma_starting_patterns = \
 
 def possibly_starting_proof(command: str) -> bool:
     stripped_command = kill_comments(command).strip()
-    return bool(re.match("(" + "|".join(lemma_starting_patterns) + r")\s*",
+    pattern = r"(?:(?:Local|Global)\s+)?(" + "|".join(lemma_starting_patterns) + r")\s*"
+    return bool(re.match(pattern,
                          stripped_command))
 
 
