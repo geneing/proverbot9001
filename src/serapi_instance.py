@@ -1385,7 +1385,7 @@ normal_lemma_starting_patterns = [
     r"(?:Polymorphic\s+)?Theorem",
     "Remark",
     "Proposition",
-    "Definition",
+    r"(?:Polymorphic\s+)?Definition",
     "Program Definition",
     "Example",
     "Fixpoint",
