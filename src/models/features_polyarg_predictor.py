@@ -722,7 +722,7 @@ class FeaturesPolyargPredictor(
                            torch.LongTensor, torch.ByteTensor,
                            torch.LongTensor, torch.FloatTensor,
                            torch.LongTensor, torch.LongTensor],
-                     data_batch)
+                     batch)
         batch_size = tokenized_goals_batch.size()[0]
         goal_size = tokenized_goals_batch.size()[1]
         stemDistributions = model.stem_classifier(word_features_batch, vec_features_batch)
