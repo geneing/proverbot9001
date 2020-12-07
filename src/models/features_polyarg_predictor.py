@@ -593,7 +593,6 @@ class FeaturesPolyargPredictor(
         parser.add_argument("--no-goal-rnn", dest="goal_rnn", action="store_false")
         parser.add_argument("--replace-rnns-with-dnns", action="store_true")
         parser.add_argument("--print-tensors", action="store_true")
-        parser.add_argument("--load-embedding", default=None)
         parser.add_argument("--load-text-tokens", default=None)
         parser.add_argument("--load-features", default=None)
         parser.add_argument("--load-tensors", default=None)
